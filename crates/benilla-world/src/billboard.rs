@@ -138,6 +138,14 @@ impl BillboardCard {
         self.scale = placement.scale;
         self.placement_rot = placement.rotation;
     }
+
+    /// Whether [`Self::re_place`] would leave the card as it is; read through a `Mut` first, so an
+    /// unmoved owner does not mark the card changed.
+    pub fn is_placed_at(&self, placement: Transform, local_pivot: Vec3) -> bool {
+        self.world_pivot == placement.transform_point(local_pivot)
+            && self.scale == placement.scale
+            && self.placement_rot == placement.rotation
+    }
 }
 
 /// A bone's rewritten parent matrix, the `flags & 0x7` arm (`0x71496d`-`0x714d0c`), taken before
@@ -417,6 +425,8 @@ pub(crate) fn face_billboards(
             &mut GlobalTransform,
             // Read for the trace probe below (the tag's low bits are the card's render alpha).
             Option<&bevy::mesh::MeshTag>,
+            // This frame's draw verdict: the model `Visibility` authority runs in `Update`.
+            Ref<Visibility>,
         ),
         Without<WorldCamera>,
     >,
@@ -428,7 +438,7 @@ pub(crate) fn face_billboards(
     let cam_moved = cam_tf.is_changed() || cam_local.as_ref().is_some_and(|l| l.is_changed());
     let (fwd, right, up) = (*cam_tf.forward(), *cam_tf.right(), *cam_tf.up());
     let elapsed_ms = time.elapsed().as_millis() as u32;
-    for (entity, mut card, mut tf, mut global, tag) in &mut cards {
+    for (entity, mut card, mut tf, mut global, tag, vis) in &mut cards {
         // A track-less card is a pure function of the camera and its owner, so it is skipped
         // when neither moved, unless it has never been placed (no attach stamp yet).
         let tracked = card.scale_anim.is_some()
@@ -437,11 +447,20 @@ pub(crate) fn face_billboards(
         if let Some(owner) = card.follow {
             match owners.get(owner) {
                 Ok(gt) => {
-                    if !tracked && !cam_moved && !gt.is_changed() {
+                    // Hidden, as below, the seat moving or not: a doodad card's own verdict reads
+                    // its place, which lags only its bone's sway while hidden, and a unit or
+                    // GameObject card's verdict never reads it.
+                    let hidden = *vis == Visibility::Hidden && card.gseq_attach_ms.is_some();
+                    if (hidden && !vis.is_changed())
+                        || (!tracked && !cam_moved && !gt.is_changed() && !vis.is_changed())
+                    {
                         continue;
                     }
                     let pivot = card.local_pivot;
-                    card.re_place(gt.compute_transform(), pivot);
+                    let placement = gt.compute_transform();
+                    if !card.is_placed_at(placement, pivot) {
+                        card.re_place(placement, pivot);
+                    }
                     // The `card` trace (`WOW_MOVE_TRACE`, ~2 Hz): each following card's place,
                     // scale and alpha, the three causes of an invisible card. `enabled_for`, so
                     // `WOW_MOVE_TRACE_TAGS` drops this busiest tag cheaply.
@@ -462,8 +481,14 @@ pub(crate) fn face_billboards(
                     continue;
                 }
             }
-        } else if !tracked && !cam_moved {
-            continue;
+        } else {
+            // A hidden fixed card is not drawn, and the reference animates only the frame's
+            // worklist: its pose waits, and is placed on the frame its `Visibility` flips. Its
+            // first pass still runs, which stamps the attach anchor below.
+            let hidden = *vis == Visibility::Hidden && card.gseq_attach_ms.is_some();
+            if hidden || (!tracked && !cam_moved && !vis.is_changed()) {
+                continue;
+            }
         }
         // The gseq attach anchor, stamped on the first placement pass (`CM2Model+0x68`). Written
         // once: a `get_or_insert` through the `Mut` would mark the card changed every frame.
@@ -491,9 +516,10 @@ pub(crate) fn face_billboards(
             rotation,
             scale: card.scale * pulse,
         };
-        // Only a real change is written, so change-detection consumers go quiet on a still frame.
+        // The local takes no change mark: the direct global write below is the pose, and a marked
+        // local would only send next frame's propagation to re-copy it.
         if *tf != placed {
-            *tf = placed;
+            *tf.bypass_change_detection() = placed;
         }
         // Propagation already ran this frame: the direct global write is what renders.
         let placed_global = GlobalTransform::from(placed);
@@ -714,6 +740,55 @@ mod tests {
             "the shaft stands 4.51 yd out of the well, not the 1.06 yd the x-collapse rendered \
              (got {shaft_yd:.3} yd)"
         );
+    }
+
+    /// A card re-faced to a turning camera writes its global directly and its local without a
+    /// change mark: a marked local would send next frame's propagation to re-copy the same pose.
+    #[test]
+    fn a_refaced_card_leaves_its_local_unmarked() {
+        #[derive(Resource, Default)]
+        struct Marks {
+            local: u32,
+            global: u32,
+        }
+        fn probe(
+            cards: Query<(Ref<Transform>, Ref<GlobalTransform>), With<BillboardCard>>,
+            mut marks: ResMut<Marks>,
+        ) {
+            for (local, global) in &cards {
+                marks.local += u32::from(local.is_changed());
+                marks.global += u32::from(global.is_changed());
+            }
+        }
+        let mut app = App::new();
+        app.init_resource::<Time>();
+        app.init_resource::<Marks>();
+        app.add_systems(Update, (face_billboards, probe).chain());
+        let cam = app
+            .world_mut()
+            .spawn((crate::view::WorldCamera, GlobalTransform::IDENTITY))
+            .id();
+        let root = app
+            .world_mut()
+            .spawn(GlobalTransform::from_translation(Vec3::new(3.0, 1.5, 0.0)))
+            .id();
+        app.world_mut().spawn((
+            BillboardCard::frame_following(BillboardKind::Spherical, Vec3::ZERO, root),
+            Transform::IDENTITY,
+        ));
+        // The spawn frames mark both; count from the first turn on.
+        app.update();
+        app.update();
+        *app.world_mut().resource_mut::<Marks>() = Marks::default();
+        for turn in 1..=3u8 {
+            *app.world_mut().get_mut::<GlobalTransform>(cam).unwrap() = GlobalTransform::from(
+                Transform::from_rotation(Quat::from_rotation_y(0.3 * f32::from(turn))),
+            );
+            app.update();
+        }
+        let marks = app.world().resource::<Marks>();
+        assert_eq!(marks.global, 3, "each turn re-faces the card");
+        assert_eq!(marks.local, 0, "the local is written without a change mark");
     }
 
     #[test]
