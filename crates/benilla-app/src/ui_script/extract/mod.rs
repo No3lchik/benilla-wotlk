@@ -29,6 +29,30 @@ pub(crate) fn ui_verify_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("WOW_UI_VERIFY").as_deref() == Ok("1"))
 }
 
+/// `WOW_UI_VERIFY=1`'s patch tally, every 5 s: frames whose patched list matched the walk, and
+/// a line for each that did not.
+fn report_patch_check(matched: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if matched {
+        HITS.fetch_add(1, Relaxed);
+    } else {
+        MISSES.fetch_add(1, Relaxed);
+        warn!("[ui-verify] patch miss: the patched list differs from the walk");
+    }
+    let Ok(mut last) = LAST.lock() else { return };
+    if last.is_none_or(|t| t.elapsed().as_secs() >= 5) {
+        *last = Some(std::time::Instant::now());
+        info!(
+            "[ui-verify] patch checks: {} matched, {} missed",
+            HITS.load(Relaxed),
+            MISSES.load(Relaxed)
+        );
+    }
+}
+
 /// One `[ui-verify]` line per miss: the first entry that differs, both sides summarized.
 fn report_epoch_miss(
     script: &UiScript,
@@ -251,6 +275,11 @@ pub(super) struct GateInputs {
     portraits: std::collections::HashMap<String, crate::portrait::PortraitSource>,
     /// The `UiFontAtlas::generation` the held glyph UVs came from; it moves only on a reset.
     generation: Option<u64>,
+    /// The paint-only write count `extracted` reflects ([`UiScript::paint_epoch`]): moved with
+    /// the mutation count standing, the script patches `extracted` instead of walking.
+    paint: Option<u64>,
+    /// The full walk `extracted` descends from ([`UiScript::extract_generation`]).
+    extract_gen: Option<u64>,
     /// Per-entry prefix ends: entry `i`'s quads are `spans[i-1]..spans[i]` of `UiQuads::quads`
     /// (from 0 for `i = 0`), which lets the splice re-convert one entry alone.
     spans: Vec<u32>,
@@ -740,16 +769,39 @@ pub(super) fn paint_script(
         && text_ui == prev.text_ui
         && booths.images.0 == prev.portraits;
     let epoch_still = prev.epoch == Some(epoch);
+    let paint = script.paint_epoch();
+    let paint_still = prev.paint == Some(paint);
     let verify = ui_verify_enabled();
-    let skip_walk = inputs_still && epoch_still && !verify;
+    let skip_walk = inputs_still && epoch_still && paint_still && !verify;
     let extracted = if skip_walk {
         None
     } else {
-        Some(script.extract())
+        // Only paint-only writes since the held list: the script re-extracts their targets into
+        // it, or answers `None` and the walk runs.
+        let patched = (inputs_still
+            && epoch_still
+            && !verify
+            && prev.extract_gen == Some(script.extract_generation()))
+        .then(|| script.extract_patched(&prev.extracted))
+        .flatten();
+        // `WOW_UI_VERIFY=1` checks the patch against the walk on every frame that could patch.
+        let checked = (verify
+            && inputs_still
+            && epoch_still
+            && !paint_still
+            && prev.extract_gen == Some(script.extract_generation()))
+        .then(|| script.extract_patched(&prev.extracted))
+        .flatten();
+        let full = patched.unwrap_or_else(|| script.extract());
+        if let Some(checked) = checked {
+            report_patch_check(checked == full);
+        }
+        Some(full)
     };
+    let extract_gen = script.extract_generation();
     let us_exm = lap();
     let n_extracted = extracted.as_ref().map_or(prev.extracted.len(), Vec::len);
-    if verify && inputs_still && epoch_still {
+    if verify && inputs_still && epoch_still && paint_still {
         if let Some(fresh) = &extracted {
             if *fresh != prev.extracted {
                 report_epoch_miss(&script, fresh, &prev.extracted);
@@ -767,6 +819,8 @@ pub(super) fn paint_script(
     if settled {
         // The held list is this count's list too, so the next quiet frame skips the walk.
         prev.epoch = Some(epoch);
+        prev.paint = Some(paint);
+        prev.extract_gen = Some(extract_gen);
         drop(extract_span);
         let us_cmp = lap();
         if cost_on {
@@ -931,9 +985,28 @@ pub(super) fn paint_script(
         if counts_stable {
             for (&j, r) in changed.iter().zip(&scratch_ranges) {
                 let (a, b) = span_bounds(&prev.spans, j);
-                if quads.quads[a..b] != scratch[r.clone()] {
-                    quads.quads[a..b].clone_from_slice(&scratch[r.clone()]);
-                    dirtied = true;
+                let fresh = &scratch[r.clone()];
+                if quads.quads[a..b] != *fresh {
+                    // A span that moved nothing but tints patches the pooled runs; any other
+                    // change rebuilds, which also drops the patches queued before it.
+                    let colour_only = !quads.dirty
+                        && quads.quads[a..b]
+                            .iter()
+                            .zip(fresh)
+                            .all(|(old, new)| old.eq_but_colour(new));
+                    if colour_only {
+                        let patch: Vec<(usize, [f32; 4])> = quads.quads[a..b]
+                            .iter()
+                            .zip(fresh)
+                            .enumerate()
+                            .filter(|(_, (old, new))| old.color != new.color)
+                            .map(|(k, (_, new))| (a + k, new.color))
+                            .collect();
+                        quads.colour_patch.extend(patch);
+                    } else {
+                        dirtied = true;
+                    }
+                    quads.quads[a..b].clone_from_slice(fresh);
                 }
             }
         } else {
@@ -974,10 +1047,13 @@ pub(super) fn paint_script(
             dirtied = true;
         }
         if dirtied {
+            quads.colour_patch.clear();
             quads.dirty = true;
         }
         prev.extracted = extracted;
         prev.epoch = Some(epoch);
+        prev.paint = Some(paint);
+        prev.extract_gen = Some(extract_gen);
         if splice_verify_enabled() {
             verify_splice(
                 prev,
@@ -1036,6 +1112,8 @@ pub(super) fn paint_script(
     prev.portraits = booths.images.0.clone();
     prev.extracted = extracted.clone();
     prev.epoch = Some(epoch);
+    prev.paint = Some(paint);
+    prev.extract_gen = Some(extract_gen);
     // Cleared only on the full-conversion path: a settled frame's map is still true, and
     // clearing it would put the body panes' cameras to sleep.
     booths.panes.0.clear();
@@ -1118,8 +1196,29 @@ pub(super) fn paint_script(
                 ),
             }
         }
+        // A frame that moved nothing but tints patches the pooled runs; anything else rebuilds.
+        let colour_only = !quads.dirty
+            && quads.quads.len() == out.len()
+            && quads
+                .quads
+                .iter()
+                .zip(&out)
+                .all(|(a, b)| a.eq_but_colour(b));
+        if colour_only {
+            let patch: Vec<(usize, [f32; 4])> = quads
+                .quads
+                .iter()
+                .zip(&out)
+                .enumerate()
+                .filter(|(_, (a, b))| a.color != b.color)
+                .map(|(i, (_, b))| (i, b.color))
+                .collect();
+            quads.colour_patch.extend(patch);
+        } else {
+            quads.colour_patch.clear();
+            quads.dirty = true;
+        }
         quads.quads = out;
-        quads.dirty = true;
     }
     if cost_on {
         let us_diff = lap();
@@ -2137,7 +2236,11 @@ mod extract_gate_tests {
             .unwrap();
         app.update();
         let quads = app.world().resource::<UiQuads>();
-        assert!(quads.dirty, "a paint write must reopen the extract gate");
+        // A tint alone reaches the mesh as a colour patch, not a rebuild.
+        assert!(
+            !quads.dirty && !quads.colour_patch.is_empty(),
+            "a paint write must reopen the extract gate, here as a colour patch"
+        );
         assert!(
             quads
                 .quads
@@ -2373,8 +2476,8 @@ mod extract_gate_tests {
             "the color write is one splice-simple entry"
         );
         assert!(
-            app.world().resource::<UiQuads>().dirty,
-            "the spliced write re-marks the quads dirty"
+            !app.world().resource::<UiQuads>().colour_patch.is_empty(),
+            "the spliced tint reaches the mesh as a colour patch"
         );
         let mut reference = app_from_script(
             r#"

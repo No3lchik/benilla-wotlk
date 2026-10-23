@@ -110,9 +110,9 @@ pub(crate) struct Model {
         std::cell::RefCell<std::collections::HashMap<String, crate::framexml::Element>>,
     pub(crate) arena: WidgetArena,
     /// Per-frame anchors, size and scale; every live frame has one from creation on.
-    pub(crate) layout_inputs: HashMap<FrameHandle, LayoutInput>,
+    pub(crate) layout_inputs: crate::widget::HandleMap<FrameHandle, LayoutInput>,
     /// Each resolvable frame's rect from the last resolve.
-    pub(crate) resolved: HashMap<FrameHandle, Rect>,
+    pub(crate) resolved: crate::widget::HandleMap<FrameHandle, Rect>,
     /// The anchor solver, kept across resolves so a steady round allocates nothing; scratch only.
     pub(crate) solver: LayoutSolver,
     /// Tier 2 of the resolve gate, the last converged inputs' fingerprint; `None` forces a resolve.
@@ -153,25 +153,25 @@ pub(crate) struct Model {
     /// Fixpoint rounds run across all solves.
     pub(crate) layout_rounds: u64,
     /// Per frame, rasterized links `(y-up rect, link, full |H…|h markup)` for `OnHyperlinkClick`.
-    pub(crate) link_spans: HashMap<FrameHandle, Vec<(Rect, String, String)>>,
+    pub(crate) link_spans: crate::widget::HandleMap<FrameHandle, Vec<(Rect, String, String)>>,
     /// Region visuals (texture, colour, text) and layout (anchors, size, justify).
-    pub(crate) region_data: HashMap<RegionHandle, RegionData>,
+    pub(crate) region_data: crate::widget::HandleMap<RegionHandle, RegionData>,
     /// Each frame's backdrop plate (`<Backdrop>` or `SetBackdrop`, the client's `frame+0x1ac`).
-    pub(crate) backdrops: HashMap<FrameHandle, backdrop::Backdrop>,
+    pub(crate) backdrops: crate::widget::HandleMap<FrameHandle, backdrop::Backdrop>,
     /// `CSimpleHTML`'s state: element fonts `+0x350`, link format `+0x360`, content nodes `+0x340`.
     pub(crate) simple_html: simplehtml::SimpleHtmlStates,
     /// Named `<Font>` objects by lowercased name, as 1.12 matches them with `SStrCmpI` (`0x783870`,
     /// `0x7838c7`); read them only through `font_object`, where the fold lives.
     pub(crate) font_objects_by_lower: HashMap<String, FontObject>,
     /// Anchored regions' owner-relative rects from the last resolve; anchor-less ones are absent.
-    pub(crate) region_resolved: HashMap<RegionHandle, Rect>,
+    pub(crate) region_resolved: crate::widget::HandleMap<RegionHandle, Rect>,
 
     /// The next object id to mint; ids start at 1, since 0 is `SCREEN`.
     pub(crate) next_id: u32,
     pub(crate) id_to_frame: IdMap<FrameHandle>,
-    pub(crate) frame_to_id: HashMap<FrameHandle, u32>,
+    pub(crate) frame_to_id: crate::widget::HandleMap<FrameHandle, u32>,
     pub(crate) id_to_region: IdMap<RegionHandle>,
-    pub(crate) region_to_id: HashMap<RegionHandle, u32>,
+    pub(crate) region_to_id: crate::widget::HandleMap<RegionHandle, u32>,
     /// Region name to id, first wins: `SetPoint` anchors to a sibling region by name, after frames.
     pub(crate) region_names: HashMap<String, u32>,
 
@@ -1142,7 +1142,7 @@ impl Model {
             load_log: Default::default(),
             framexml_fonts: Default::default(),
             arena: WidgetArena::new(),
-            layout_inputs: HashMap::new(),
+            layout_inputs: Default::default(),
             solver: LayoutSolver::new(),
             layout_fingerprint: None,
             layout_epoch: 0,
@@ -1158,18 +1158,18 @@ impl Model {
             layout_solves: 0,
             layout_gate_walks: 0,
             layout_rounds: 0,
-            resolved: HashMap::new(),
-            link_spans: HashMap::new(),
-            region_data: HashMap::new(),
-            backdrops: HashMap::new(),
+            resolved: Default::default(),
+            link_spans: Default::default(),
+            region_data: Default::default(),
+            backdrops: Default::default(),
             simple_html: simplehtml::SimpleHtmlStates::new(),
             font_objects_by_lower: HashMap::new(),
-            region_resolved: HashMap::new(),
+            region_resolved: Default::default(),
             next_id: 1,
             id_to_frame: IdMap::default(),
-            frame_to_id: HashMap::new(),
+            frame_to_id: Default::default(),
             id_to_region: IdMap::default(),
-            region_to_id: HashMap::new(),
+            region_to_id: Default::default(),
             region_names: HashMap::new(),
             scripts: HashMap::new(),
             on_update_frames: Vec::new(),
@@ -1813,11 +1813,60 @@ fn derive_trace_armed() -> bool {
 pub(crate) struct ModelCell {
     inner: Model,
     epoch: u64,
+    /// Paint-only writes, which leave `epoch` standing: the targets they touched.
+    pub(crate) paint: std::cell::RefCell<PaintMarks>,
+    /// The last full extract's per-target entry ranges ([`ExtractIndex`]).
+    pub(crate) extract_index: std::cell::RefCell<Option<ExtractIndex>>,
+}
+
+/// The most marks one patch walk takes; past it the extract walks in full.
+const MAX_PAINT_MARKS: usize = 512;
+
+/// The targets paint-only writes touched since the last extract, and their running count.
+#[derive(Default)]
+pub(crate) struct PaintMarks {
+    /// Every paint-only write, monotone: the app's gate compares it frame to frame.
+    pub(crate) count: u64,
+    targets: Vec<crate::order::ZTarget>,
+    overflow: bool,
+}
+
+impl PaintMarks {
+    /// Forget the marks a full walk has read; the count stands.
+    pub(crate) fn clear_marks(&mut self) {
+        self.targets.clear();
+        self.overflow = false;
+    }
+
+    /// The marks for a patch walk, cleared; `None` when they overflowed.
+    pub(crate) fn take_marks(&mut self) -> Option<Vec<crate::order::ZTarget>> {
+        let overflow = std::mem::take(&mut self.overflow);
+        let targets = std::mem::take(&mut self.targets);
+        (!overflow).then_some(targets)
+    }
+}
+
+/// Where each draw target's entries sit in the last full extract, under the mutation count it was
+/// walked at, so a paint-only frame re-extracts a few targets into that list.
+pub(crate) struct ExtractIndex {
+    pub(crate) generation: u64,
+    pub(crate) epoch: u64,
+    /// Target → (first entry, entry count, its draw key).
+    pub(crate) entries:
+        crate::widget::HandleMap<crate::order::ZTarget, (u32, u32, crate::order::ZKey)>,
+    pub(crate) len: usize,
+    /// No target appeared twice, so each has one range.
+    pub(crate) unique: bool,
 }
 
 impl ModelCell {
     pub(crate) fn new(inner: Model) -> ModelCell {
-        ModelCell { inner, epoch: 1 }
+        ModelCell {
+            inner,
+            epoch: 1,
+            paint: Default::default(),
+            extract_index: Default::default(),
+        }
     }
 
     /// The count as of now; equal counts mean no mutable borrow in between.
@@ -1829,6 +1878,23 @@ impl ModelCell {
     /// nothing the extract reads.
     pub(crate) fn set_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
+    }
+
+    /// The model for a write that changes only how `targets` paint (an alpha, a tint): it leaves
+    /// the mutation count standing and marks them, so the extract re-reads those targets alone.
+    /// A write that moves anything else (layout, visibility, order, text) takes the plain borrow.
+    pub(crate) fn paint_mut(&mut self, targets: &[crate::order::ZTarget]) -> &mut Model {
+        let marks = self.paint.get_mut();
+        marks.count = marks.count.wrapping_add(1);
+        if !marks.overflow {
+            if marks.targets.len() + targets.len() > MAX_PAINT_MARKS {
+                marks.overflow = true;
+                marks.targets.clear();
+            } else {
+                marks.targets.extend_from_slice(targets);
+            }
+        }
+        &mut self.inner
     }
 }
 
