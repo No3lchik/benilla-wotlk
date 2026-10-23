@@ -889,6 +889,8 @@ type SwimMarkQuery = (
 /// The stamp [`mark_swimming_creatures`] leaves once a unit's room claim settles; 1.12 water is
 /// static, so it holds until the unit moves or the `ColliderEpoch` bumps.
 #[derive(Component)]
+// Sparse: stamped and cleared as units move, so it splits no table.
+#[component(storage = "SparseSet")]
 pub(in crate::net) struct SwimEvaluated;
 
 /// The exit band (yd) below the swim boundary: the player boundary's 1/36-yd hysteresis
@@ -1235,6 +1237,17 @@ mod under_floor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The swim stamp is set and cleared as units move: a table column would split the unit tables
+    /// every query walks.
+    #[test]
+    fn the_swim_mark_is_a_sparse_set() {
+        use bevy::ecs::component::StorageType;
+        assert_eq!(
+            <SwimEvaluated as Component>::STORAGE_TYPE,
+            StorageType::SparseSet
+        );
+    }
 
     /// A spline `frac` of the way through its ride: 10 s duration, started `frac·10 s` ago.
     fn spline_at(points: Vec<[f32; 3]>, grounded: bool, frac: f32) -> (Spline, Instant) {

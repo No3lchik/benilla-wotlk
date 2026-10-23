@@ -1069,6 +1069,8 @@ pub struct ModelPart {
 /// Why the streamer left this submesh on the entity path, one static label per batch for the
 /// census (`VIS_CENSUS … why …`); absent on units, GameObjects and everything the app spawns.
 #[derive(Component, Clone, Copy)]
+// Sparse: only the census reads it, and a column would split the parts' tables by spawn path.
+#[component(storage = "SparseSet")]
 pub struct EntityPathWhy(pub &'static str);
 
 /// The model-`Visibility` authority's set; the first-person self hide runs after it and wins.
@@ -1077,6 +1079,33 @@ pub struct ModelVisSet;
 
 #[cfg(test)]
 mod tests {
+    /// The markers toggled at runtime, or read only by the census, live outside the tables: as
+    /// table columns each would split its family's tables, and every query pays per table.
+    #[test]
+    fn toggled_markers_are_sparse_sets() {
+        use bevy::ecs::component::{Component, StorageType};
+        for (name, storage) in [
+            (
+                "AnimParked",
+                <crate::rig_anim::AnimParked as Component>::STORAGE_TYPE,
+            ),
+            (
+                "RigStarved",
+                <crate::rig_palette::RigStarved as Component>::STORAGE_TYPE,
+            ),
+            (
+                "ParkedMesh",
+                <super::park::ParkedMesh as Component>::STORAGE_TYPE,
+            ),
+            (
+                "EntityPathWhy",
+                <super::EntityPathWhy as Component>::STORAGE_TYPE,
+            ),
+        ] {
+            assert_eq!(storage, StorageType::SparseSet, "{name}");
+        }
+    }
+
     use super::replace_fog_policy;
     use benilla_formats::FogPolicy;
 

@@ -171,12 +171,15 @@ impl Plugin for WorldFoundation {
         // No pre-step transform propagation: movers write `Position`/`Rotation` directly, so a
         // second whole-world sweep buys nothing; an opening door's hull reaches physics a frame
         // late. `WOW_PHYS_PREPROP=1` restores avian's default.
-        if std::env::var_os("WOW_PHYS_PREPROP").is_none() {
-            app.insert_resource(avian3d::physics_transform::PhysicsTransformConfig {
-                propagate_before_physics: false,
-                ..Default::default()
-            });
-        }
+        //
+        // avian's transform-to-position sync walks every collider each step; ours walks the moved
+        // ones (`collision::sync_moved_positions`).
+        app.insert_resource(avian3d::physics_transform::PhysicsTransformConfig {
+            propagate_before_physics: std::env::var_os("WOW_PHYS_PREPROP").is_some(),
+            transform_to_position: false,
+            ..Default::default()
+        });
+        crate::collision::add_moved_position_sync(app, FixedPostUpdate);
         // `WOW_PHYS_HZ=<hz>`: the fixed loop's rate, a measurement lever and never a setting (at
         // 8 Hz streamed colliders reach the spatial trees up to 125 ms late).
         if let Some(hz) = std::env::var("WOW_PHYS_HZ")
@@ -211,5 +214,16 @@ impl Plugin for WorldFoundation {
         if std::env::var_os("WOW_INDIRECT").is_none() {
             app.register_required_components::<bevy::camera::Camera, bevy::render::view::NoIndirectDrawing>();
         }
+    }
+
+    fn finish(&self, app: &mut App) {
+        // Bevy's prepass copies every mesh's `GlobalTransform` into `PreviousGlobalTransform` each
+        // frame for motion vectors; no view here asks for them (no `MotionVectorPrepass`, no TAA),
+        // and a mesh without the component extracts its current transform as its previous one.
+        let _ = app.remove_systems_in_set(
+            PreUpdate,
+            bevy::pbr::update_mesh_previous_global_transforms,
+            bevy::ecs::schedule::ScheduleCleanupPolicy::RemoveSetAndSystems,
+        );
     }
 }
