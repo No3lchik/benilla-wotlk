@@ -1058,6 +1058,8 @@ mod buff_tests;
 mod target_aura_tests;
 
 #[cfg(test)]
+mod achievement_open_cost;
+#[cfg(test)]
 mod achievement_ui_tests;
 #[cfg(test)]
 mod alert_frame_tests;
