@@ -6,9 +6,9 @@ use crate::widget::{FrameHandle, RegionHandle, WidgetArena};
 use super::{
     auction, backdrop, bank, bind_confirm, camera_view, char_stats, chat_window, colorselect,
     combat_log, container, cursor, death, duel, follow, gossip, guild, inspect, item_text, lfg,
-    loot, loot_roll, macros, mail, merchant, parse_unit_token, party, petition, pvp, quest,
-    quest_log, reputation, session, simplehtml, skills, slider, social, spellbook, stable, taxi,
-    trade, tradeskill, trainer, unit_menu, weapon_enchant, ActionSlot, AuraState, FontObject,
+    loot, loot_roll, macros, mail, merchant, mirror_timer, parse_unit_token, party, petition, pvp,
+    quest, quest_log, reputation, session, simplehtml, skills, slider, social, spellbook, stable,
+    taxi, trade, tradeskill, trainer, unit_menu, weapon_enchant, ActionSlot, AuraState, FontObject,
     ItemTemplateView, MusicRequest, PlayerReqState, RegionData, ScriptValue, SoundRequest,
     UnitState, UnitTokenParse,
 };
@@ -369,6 +369,12 @@ pub(crate) struct Model {
     pub(crate) default_language: Option<String>,
     /// `AcceptDuel`, `CancelDuel` and `StartDuel` calls; Lua sees duels only through events.
     pub(crate) duel_requests: Vec<duel::DuelRequest>,
+    /// The three mirror-timer records (`0xbd0b80`); `None` is an empty one.
+    pub(crate) mirror_timers: [Option<mirror_timer::MirrorTimer>; 3],
+    /// Today's game date, 0-based: weekday, day of the month, month, years since 2000.
+    pub(crate) calendar_date: (u8, u8, u8, u8),
+    /// The server's pending calendar invite count.
+    pub(crate) calendar_pending_invites: u32,
     /// `FollowUnit` and `FollowByName` calls; Lua sees following only as `AUTOFOLLOW_*` events.
     pub(crate) follow_requests: Vec<follow::FollowRequest>,
     /// `SetView`, `SaveView`, `ResetView`, `NextView`, `PrevView` and `FlipCameraYaw` calls; the
@@ -1286,6 +1292,9 @@ impl Model {
             user_placed_changed: false,
             default_language: None,
             duel_requests: Vec::new(),
+            mirror_timers: Default::default(),
+            calendar_date: (0, 0, 0, 0),
+            calendar_pending_invites: 0,
             follow_requests: Vec::new(),
             camera_view_requests: Vec::new(),
             session_requests: Vec::new(),

@@ -120,6 +120,7 @@ pub(crate) mod addon;
 mod addon_enable;
 pub mod addon_gate;
 pub(crate) mod anim;
+mod calendar_clock;
 mod client;
 mod clock;
 mod cvars;
@@ -140,6 +141,7 @@ mod glue_customize;
 mod glue_realm;
 mod glue_select;
 mod glue_system;
+mod mirror_timer;
 pub use glue::{VmKind, GLUE_EVENTS};
 pub use glue_addons::GlueAddonChange;
 pub use glue_core::{
@@ -331,6 +333,7 @@ pub use guild_bank::{
 };
 pub use input_verbs::{BindingInput, FiredInput, HeldInput};
 pub use macro_options::OptionState;
+pub use mirror_timer::{MirrorTimer, MIRROR_TIMER_TOKENS};
 pub use modelframe::ModelPaneFrame;
 pub use petition::{
     petition_type_name, validate_guild_name, ArenaBannerChoice, PetitionRecordView,
@@ -966,6 +969,8 @@ fn install_in_game(lua: &Lua) -> mlua::Result<()> {
     instance::install(lua)?;
     gm_ticket::install(lua)?;
     duel::install(lua)?;
+    mirror_timer::install(lua)?;
+    calendar_clock::install(lua)?;
     follow::install(lua)?;
     camera_view::install(lua)?;
     input_verbs::install(lua)?;
