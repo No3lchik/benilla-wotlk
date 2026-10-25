@@ -1707,6 +1707,12 @@ pub(super) fn writer_loop(
                         w.learn_talent(talent_id, rank)
                     }
                     ClientCommand::RemoveGlyph { socket } => w.remove_glyph(socket),
+                    ClientCommand::SetTitle { mask_id } => w.set_title(mask_id),
+                    ClientCommand::EquipmentSetSave(set) => {
+                        w.equipment_set_save(set.guid, set.id, &set.name, &set.icon, &set.items)
+                    }
+                    ClientCommand::EquipmentSetDelete { guid } => w.equipment_set_delete(guid),
+                    ClientCommand::EquipmentSetUse { slots } => w.equipment_set_use(&slots),
                     ClientCommand::LearnPreviewTalents { talents } => {
                         w.learn_preview_talents(&talents)
                     }

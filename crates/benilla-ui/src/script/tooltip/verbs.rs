@@ -298,6 +298,43 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             Ok(())
         })?,
     )?;
+    // AddTexture(texture [, minx, maxx, miny, maxy]) (`0x61d810`): a number third argument needs
+    // all four coordinates (`0x61d8f1`), else the full texture; the tint is white. The stock spell
+    // stat tooltips hang a school icon on each row with it (PaperDollFrame.lua:1056).
+    m.set(
+        "AddTexture",
+        lua.create_function(|lua, (this, args): (Table, Variadic<Value>)| {
+            let texture = match args.first() {
+                Some(v @ (Value::String(_) | Value::Integer(_) | Value::Number(_))) => {
+                    optional_string(lua, v)
+                }
+                _ => None,
+            };
+            let number = |i: usize| {
+                args.get(i)
+                    .and_then(|v| lua.coerce_number(v.clone()).ok().flatten())
+            };
+            let coords = match number(1) {
+                None => None,
+                Some(minx) => match (number(2), number(3), number(4)) {
+                    (Some(maxx), Some(miny), Some(maxy)) => Some(crate::script::TexCoords::Rect([
+                        minx as f32,
+                        maxx as f32,
+                        miny as f32,
+                        maxy as f32,
+                    ])),
+                    _ => {
+                        let h = frame_handle_of(lua, &this)?;
+                        return Err(mlua::Error::runtime(format!(
+                            "Usage: {}:AddTexture(\"filename\" [, minx, maxx, miny, maxy])",
+                            display_name(lua, h)
+                        )));
+                    }
+                },
+            };
+            super::add_texture(lua, &this, texture, coords)
+        })?,
+    )?;
     // SetMinimumWidth(w [, force]): the auto-size floor `SetTooltipMoney` raises (`0x61d040`).
     m.set(
         "SetMinimumWidth",
@@ -389,6 +426,8 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     crate::script::tooltip_spell::install_methods(lua, &m)?;
     crate::script::talent::install_tooltip_method(lua, &m)?;
     crate::script::glyph::install_tooltip_method(lua, &m)?;
+    crate::script::equipment_manager::install_tooltip_method(lua, &m)?;
+    crate::script::currency::install_tooltip_methods(lua, &m)?;
     crate::script::tooltip_unit::install_methods(lua, &m)?;
     crate::script::tooltip_item::wrap_setters(lua, &m)?;
 
