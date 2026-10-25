@@ -1,7 +1,7 @@
-//! The CVar registry, host side: the reference's engine-side table (`ConsoleVar.cpp`, 0xc4-byte
-//! records of name, value, default, latch slot and the change callback handed to `CVar::Register`,
-//! `0x63db90`). [`Cvars`] holds every registered row's live value, survives a VM replacement and is
-//! what `config.toml` is composed from; the script VM keeps a mirror for Lua's synchronous
+//! The CVar registry, host side: the reference's engine-side table (`ConsoleVar.cpp`, records of
+//! name, value, default, latch slot and the change callback handed to `CVar::Register`,
+//! `0x767fc0`). [`Cvars`] holds every registered row's live value, survives a VM replacement and is
+//! what the archives are composed from; the script VM keeps a mirror for Lua's synchronous
 //! `GetCVar`/`SetCVar` ([`benilla_ui::script::UiScript::seed_cvars`]) whose writes queue back here.
 //!
 //! - [`REGISTERED`] holds only vars something reads, a host knob or a Lua consumer. A row's default
@@ -9,18 +9,22 @@
 //! - The change callback is a Bevy observer on [`CvarChanged`], beside the knob it writes; the
 //!   registry applies nothing itself.
 //! - A latched row's write is staged in [`Row::pending`] until [`Cvars::commit_latched`], the
-//!   reference's `0x639ec0` inside `RestartGx`. A stage never committed is dropped at exit, as the
-//!   reference's `SaveConfig` writes only the applied value (`rec+0x20`).
-//! - Boot folds `benilla-config/config.toml` in and fires the observers before anything after
-//!   [`CvarLoad`]; each frame drains the VM's writes in and pushes the registry's out; a dirty
-//!   registry saves after one quiet second or at exit, writing only values off their default and
-//!   keeping unknown keys verbatim.
+//!   reference's `0x639ec0` inside `RestartGx`; the archive writes the stage, as
+//!   `CVar::IterateForArchive` (`0x767030`) prefers the latched value.
+//! - Each row is archived in one file by its [`table::Scope`]: `WTF\Config.wtf`, or the account's
+//!   or the character's `config-cache.wtf`, account-data slots 0 and 1 ([`crate::account_data`]).
+//!   All three are `SET name "value"` lines ([`wtf`]), every row off its default (compared
+//!   case-blind) in creation order; a `Config.wtf` name no row claims is written back as read,
+//!   and an addon's `RegisterCVar` row is never archived (flag `0x80`).
+//! - Boot folds `Config.wtf`, then `RunOnce*.wtf` and `realmlist.wtf`, in and fires the observers
+//!   before anything after [`CvarLoad`]; each frame drains the VM's writes in and pushes the
+//!   registry's out. `Config.wtf` is written when something moved, at Enter World, at the UI
+//!   shutdown and at exit (`CVar::SaveAll` `0x767100`); the scoped files at the UI shutdown.
 //!
 //! Env overrides (`WOW_UI_SCALE`, `WOW_FARCLIP`, …) win for the session and never touch the file
 //! ([`Cvars::own_for_session`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
 
@@ -28,16 +32,11 @@ use crate::ui_script::VmMemo;
 use benilla_ui::script::{SeededCvar, UiScript};
 
 mod table;
+pub(crate) mod wtf;
 #[cfg(test)]
 use table::Reference;
+pub(crate) use table::Scope;
 pub(crate) use table::{registered_pairs, registered_rows, REGISTERED};
-
-/// `config.toml`: a `[cvars]` table of `Name = "value"` strings, sorted so every save is stable.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct LocalConfig {
-    #[serde(default)]
-    cvars: BTreeMap<String, String>,
-}
 
 // ─── The registry ────────────────────────────────────────────────────────────────────────────
 
@@ -80,23 +79,39 @@ pub(crate) struct Row {
     /// The registered spelling.
     pub(crate) name: String,
     pub(crate) default: String,
+    /// The reference's registered string, what the archive compares against
+    /// ([`table::Registered::reference_default`]), so a file means to 12340 what it means here.
+    pub(crate) archive_default: String,
     /// The applied value: what `GetCVar` answers and what the file is composed from.
     pub(crate) value: String,
     /// A latched row's staged value (`rec+0x38`), applied by [`Cvars::commit_latched`].
     pub(crate) pending: Option<String>,
     /// The reference's flag bit1.
     pub(crate) latched: bool,
-    /// Declared by an addon's `RegisterCVar`: persisted like any row and re-seeded into every later
-    /// VM, so the addon's re-declaration is a no-op.
+    /// Declared by an addon's `RegisterCVar`: never archived (`0x50fea0` registers it with
+    /// `0x80`), and re-seeded into every later VM, so the addon's re-declaration is a no-op.
     pub(crate) addon: bool,
-    /// [`table::Registered::per_character`]: never saved or loaded, back at its default at logout.
-    pub(crate) per_character: bool,
+    /// The file it is archived in.
+    pub(crate) scope: Scope,
+    /// [`table::Registered::hidden`]: kept out of every VM's mirror.
+    pub(crate) hidden: bool,
 }
 
 impl Row {
     /// A row whose default parses as a number refuses a write that does not ([`Cvars::set`]).
     fn numeric(&self) -> bool {
         self.default.trim().parse::<f32>().is_ok()
+    }
+
+    /// What the archive writes for the row, or `None` at the reference's default (`0x767030`:
+    /// the latched value first, compared case-blind with `SStrCmpI`); an addon's row is never
+    /// archived.
+    fn archived(&self) -> Option<&str> {
+        if self.addon {
+            return None;
+        }
+        let value = self.pending.as_deref().unwrap_or(&self.value);
+        (!value.eq_ignore_ascii_case(&self.archive_default)).then_some(value)
     }
 }
 
@@ -121,8 +136,12 @@ pub(crate) struct Cvars {
     rows: Vec<Row>,
     /// Lowercased name → row.
     index: HashMap<String, usize>,
-    /// The file's `[cvars]` entries in their own spelling, the merge base of every save.
-    file: BTreeMap<String, String>,
+    /// `Config.wtf`'s entries in file order and their own spelling, the merge base of every save:
+    /// a name no row claims is written back from here.
+    file: Vec<(String, String)>,
+    /// A `config-cache.wtf`'s names no row claims, by scope: 12340 registers every one of them
+    /// with its scope, so each goes back to the file it came from.
+    scoped_orphans: Vec<(Scope, String, String)>,
     /// Lowercased names the session owns rather than the player: the env levers, and `gxApi`, the
     /// render backend. Never saved; the file's entry is left as found.
     session_owned: HashSet<String>,
@@ -131,9 +150,8 @@ pub(crate) struct Cvars {
     events: Vec<CvarChanged>,
     /// Host-side writes the VM's mirror has not seen; cleared by a seed.
     outbox: Vec<(String, String)>,
-    /// A change since the last save; `last_change` drives the one-quiet-second debounce.
+    /// A value moved since the last `Config.wtf` save (`m_needsSave` `0xca19f8`).
     dirty: bool,
-    last_change: Option<Instant>,
 }
 
 impl Default for Cvars {
@@ -141,22 +159,24 @@ impl Default for Cvars {
         let mut cvars = Self {
             rows: Vec::with_capacity(REGISTERED.len()),
             index: HashMap::with_capacity(REGISTERED.len()),
-            file: BTreeMap::new(),
+            file: Vec::new(),
+            scoped_orphans: Vec::new(),
             session_owned: HashSet::new(),
             events: Vec::new(),
             outbox: Vec::new(),
             dirty: false,
-            last_change: None,
         };
         for r in registered_rows() {
             cvars.insert_row(Row {
                 name: r.name.to_string(),
                 default: r.default.to_string(),
+                archive_default: r.reference_default().to_string(),
                 value: r.default.to_string(),
                 pending: None,
                 latched: r.latched,
                 addon: false,
-                per_character: r.per_character,
+                scope: r.scope,
+                hidden: r.hidden,
             });
         }
         cvars
@@ -217,23 +237,22 @@ impl Cvars {
 
     fn touch(&mut self) {
         self.dirty = true;
-        self.last_change = Some(Instant::now());
     }
 
-    /// Remove a `config.toml` entry no row claims, a setting retired from the table, and return
+    /// Remove a `Config.wtf` entry no row claims, a setting retired from the table, and return
     /// its value; the next save writes the file without it.
     pub(crate) fn retire_file_entry(&mut self, name: &str) -> Option<String> {
         if self.index.contains_key(&name.to_ascii_lowercase()) {
             return None;
         }
-        let key = self
+        let at = self
             .file
-            .keys()
-            .find(|k| k.eq_ignore_ascii_case(name))?
-            .clone();
-        let value = self.file.remove(&key);
+            .iter()
+            .position(|(k, _)| k.eq_ignore_ascii_case(name))?;
+        let (_, value) = self.file.remove(at);
+        self.file.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
         self.touch();
-        value
+        Some(value)
     }
 
     /// A write from either side of the VM boundary. A `from_vm` write is not echoed back, but a
@@ -279,7 +298,7 @@ impl Cvars {
             old,
             new: value.to_string(),
         });
-        if !from_vm {
+        if !from_vm && !self.rows[i].hidden {
             self.outbox.push((name, value.to_string()));
         }
         self.touch();
@@ -383,23 +402,26 @@ impl Cvars {
         let saved = self
             .file
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .rfind(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.clone());
         self.insert_row(Row {
             name: name.to_string(),
             default: default.to_string(),
+            archive_default: default.to_string(),
             value: saved.unwrap_or_else(|| default.to_string()),
             pending: None,
             latched: false,
             addon: true,
-            per_character: false,
+            scope: Scope::Config,
+            hidden: false,
         });
     }
 
     /// Fold the file in: a known, player-owned key becomes its row's applied value and fires (the
     /// reference's `Register` on a record `Config.wtf` created calls the callback); an unknown key
-    /// is kept for the save and warned; a session-owned one is skipped. Nothing dirties.
-    fn load_file(&mut self, file: BTreeMap<String, String>) {
+    /// is kept for the save, as the placeholder `SET` makes for it (`0x768307`); a session-owned
+    /// one is skipped. Nothing dirties.
+    fn load_file(&mut self, file: Vec<(String, String)>) {
         for (name, value) in &file {
             let key = name.to_ascii_lowercase();
             let Some(&i) = self.index.get(&key) else {
@@ -414,8 +436,8 @@ impl Cvars {
                 continue;
             }
             let row = &mut self.rows[i];
-            if row.per_character {
-                warn!("config: {name} is a per-character cvar, not read from the file");
+            if row.scope != Scope::Config {
+                warn!("config: {name} is kept in a config-cache.wtf, not read from Config.wtf");
                 continue;
             }
             if row.numeric() && value.trim().parse::<f32>().is_err() {
@@ -435,13 +457,71 @@ impl Cvars {
         self.file = file;
     }
 
-    /// `CVar::DeleteCharacterCVars` (`0x767350`) at logout: every per-character row back at its
-    /// default, silently, as the reference deletes the records without a callback.
-    pub(crate) fn drop_character_rows(&mut self) {
-        for row in self.rows.iter_mut().filter(|r| r.per_character) {
+    /// `CVar::DeleteCharacterCVars` (`0x767350`) at the UI shutdown, and
+    /// `CVar::DeleteAccountCVars` (`0x7673a0`) at an account login: every row of the scope back at
+    /// its default, silently, as the reference deletes the records without a callback.
+    pub(crate) fn reset_scope(&mut self, scope: Scope) {
+        for row in self.rows.iter_mut().filter(|r| r.scope == scope) {
             row.value = row.default.clone();
             row.pending = None;
         }
+        self.scoped_orphans.retain(|(s, _, _)| *s != scope);
+    }
+
+    /// A slot's `config-cache.wtf` run in, its `SET`s in order: a row takes the value and fires;
+    /// a name no row claims is kept for the same file, where 12340's registered row would save it.
+    pub(crate) fn load_scope(&mut self, scope: Scope, text: &str) {
+        for (name, value) in wtf::parse(text) {
+            match self.slot(&name) {
+                Some(i) if self.rows[i].numeric() && value.trim().parse::<f32>().is_err() => {
+                    warn!("config-cache: {name}: unparseable value '{value}' ignored");
+                }
+                Some(i) => {
+                    let row = &mut self.rows[i];
+                    if row.value == value {
+                        continue;
+                    }
+                    let old = std::mem::replace(&mut row.value, value.clone());
+                    row.pending = None;
+                    let name = row.name.clone();
+                    self.outbox.push((name.clone(), value.clone()));
+                    self.events.push(CvarChanged {
+                        name,
+                        old,
+                        new: value,
+                    });
+                }
+                None => {
+                    let kept = self
+                        .scoped_orphans
+                        .iter_mut()
+                        .find(|(s, k, _)| *s == scope && k.eq_ignore_ascii_case(&name));
+                    match kept {
+                        Some((_, _, v)) => *v = value,
+                        None => self.scoped_orphans.push((scope, name, value)),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A scoped file's body (`SaveGameCVarsCallback` `0x512890`): the scope's rows off their
+    /// default, in creation order, then the names it held that no row claims.
+    pub(crate) fn compose_scope(&self, scope: Scope) -> String {
+        wtf::compose(
+            self.rows
+                .iter()
+                .filter(|r| {
+                    r.scope == scope && !self.session_owned.contains(&r.name.to_ascii_lowercase())
+                })
+                .filter_map(|r| r.archived().map(|v| (r.name.as_str(), v)))
+                .chain(
+                    self.scoped_orphans
+                        .iter()
+                        .filter(|(s, _, _)| *s == scope)
+                        .map(|(_, k, v)| (k.as_str(), v.as_str())),
+                ),
+        )
     }
 
     /// The file's entries no row claims: a newer build's keys, or an addon's not yet registered.
@@ -454,10 +534,11 @@ impl Cvars {
             .collect()
     }
 
-    /// The whole table as a VM's mirror is seeded from it.
+    /// The table as a VM's mirror is seeded from it, a hidden row left out.
     pub(crate) fn vm_seed(&self) -> Vec<SeededCvar> {
         self.rows
             .iter()
+            .filter(|r| !r.hidden)
             .map(|r| SeededCvar {
                 name: r.name.clone(),
                 value: r.value.clone(),
@@ -485,38 +566,48 @@ impl Cvars {
         std::mem::take(&mut self.outbox)
     }
 
-    /// The file to save: the previous file as the merge base, each row off its default at its
-    /// applied value (a staged one is not the player's yet), each at its default removed;
-    /// session-owned and unknown keys untouched.
-    fn compose(&self) -> BTreeMap<String, String> {
-        let mut out = self.file.clone();
-        for row in &self.rows {
-            let key = row.name.to_ascii_lowercase();
-            if self.session_owned.contains(&key) || row.per_character {
+    /// `Config.wtf` to save, in the reference's list order: the file's names first, as its `SET`
+    /// placeholders were created first, then every other row in registration order. A name no row
+    /// claims goes back as read, a session-owned row as the file had it, a `Config.wtf` row when
+    /// off its default; the scoped rows and an addon's are left out.
+    fn compose(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for (name, value) in &self.file {
+            let key = name.to_ascii_lowercase();
+            if !seen.insert(key.clone()) {
                 continue;
             }
-            // Match any existing entry case-insensitively so a hand-edited spelling doesn't fork.
-            let existing = out
-                .keys()
-                .find(|k| k.eq_ignore_ascii_case(&row.name))
-                .cloned();
-            if row.value == row.default {
-                if let Some(k) = existing {
-                    out.remove(&k);
+            match self.index.get(&key) {
+                None => out.push((name.clone(), value.clone())),
+                Some(_) if self.session_owned.contains(&key) => {
+                    out.push((name.clone(), value.clone()));
                 }
-            } else {
-                out.insert(
-                    existing.unwrap_or_else(|| row.name.clone()),
-                    row.value.clone(),
-                );
+                Some(&i) => {
+                    let row = &self.rows[i];
+                    if row.scope == Scope::Config {
+                        if let Some(v) = row.archived() {
+                            out.push((row.name.clone(), v.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        for row in &self.rows {
+            let key = row.name.to_ascii_lowercase();
+            if row.scope != Scope::Config
+                || seen.contains(&key)
+                || self.session_owned.contains(&key)
+            {
+                continue;
+            }
+            if let Some(v) = row.archived() {
+                out.push((row.name.clone(), v.to_string()));
             }
         }
         out
     }
 }
-
-/// How long a dirty config waits before saving: long enough to coalesce a slider drag.
-const SAVE_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The startup fold of `config.toml` into the registry and the knobs ([`load_config`]). A set
 /// because the world camera reads `gxMultisample` once at spawn, so `setup_player` must order after
@@ -544,11 +635,12 @@ impl Plugin for CvarPlugin {
                     .chain()
                     .after(crate::ui_script::UiInput),
             )
-            // In `Last`, after every `Update` writer of the registry, so the save reads the frame's
-            // settled state; before the exit flush, which finds it clean on a quiet exit frame.
+            // Enter World's save (`CGlueMgr::EnterWorld` `0x4d9ed8`), in `Last`, after every
+            // `Update` writer of the registry.
+            .add_message::<SaveConfig>()
             .add_systems(
                 Last,
-                save_config_when_quiet.before(crate::shutdown::OnAppExit),
+                save_config_on_request.before(crate::shutdown::OnAppExit),
             );
         // The exit flush runs on the exit edge: the close button's `AppExit` is written in
         // `PostUpdate`, so an `Update` save never sees it.
@@ -625,6 +717,7 @@ fn session_values(world: &World) -> Vec<(&'static str, Option<String>)> {
 fn load_config(world: &mut World) {
     let session = session_values(world);
     let stored = stored_config();
+    let extra = startup_extras();
     let events = {
         let mut cvars = world.resource_mut::<Cvars>();
         for (name, value) in session {
@@ -651,6 +744,22 @@ fn load_config(world: &mut World) {
                 }
             }
         }
+        // `RunOnce*.wtf` and the realmlist files run after `Config.wtf`, each `SET` a write that
+        // reaches the file at the next save (`InitializeGlobal` `0x4067f0`, `0x6b0bf0`).
+        for (name, value) in extra {
+            if cvars.row(&name).is_some() {
+                if !cvars.is_session_owned(&name) {
+                    cvars.set(&name, &value);
+                }
+            } else if !cvars
+                .file
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(&name))
+            {
+                cvars.file.push((name, value));
+                cvars.touch();
+            }
+        }
         cvars.take_events()
     };
     for event in events {
@@ -673,44 +782,56 @@ const RETIRED_ROWS: [&str; 9] = [
     "M2UsePixelShaders",
 ];
 
-/// What the one read of `config.toml` found.
+/// What the one read of `Config.wtf` found.
 enum StoredConfig {
     /// No file, no install, or a hermetic capture: every value is its registered default.
     Absent,
-    Table(BTreeMap<String, String>),
+    Table(Vec<(String, String)>),
     /// Unreadable or malformed; the message is carried because this read runs before `LogPlugin`
     /// exists.
     Bad(String),
 }
 
-/// Read `config.toml`, for [`load_config`] and for the primary window in [`crate::run`], which
+/// Read `Config.wtf`, for [`load_config`] and for the primary window in [`crate::run`], which
 /// needs `gxWindow`/`gxResolution` before it exists. Not cached: a process-wide cache would answer
-/// every test from the first one's file.
+/// every test from the first one's file. Read as bytes, since a value is raw (`flaggedTutorials`
+/// carries a 0x01).
 fn stored_config() -> StoredConfig {
     let Some(path) = crate::local_state::config_path() else {
         return StoredConfig::Absent; // hermetic capture or no install: session-only state
     };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StoredConfig::Absent,
-        Err(e) => return StoredConfig::Bad(format!("config: cannot read {}: {e}", path.display())),
-    };
-    match toml::from_str::<LocalConfig>(&text) {
-        Ok(cfg) => StoredConfig::Table(cfg.cvars),
-        Err(e) => StoredConfig::Bad(format!(
-            "config: {} is malformed ({e}) — running on defaults",
-            path.display()
-        )),
+    match std::fs::read(&path) {
+        Ok(bytes) => StoredConfig::Table(wtf::parse(&String::from_utf8_lossy(&bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => StoredConfig::Absent,
+        Err(e) => StoredConfig::Bad(format!("config: cannot read {}: {e}", path.display())),
     }
 }
 
-/// One CVar as `config.toml` holds it, before the `App` exists: for the primary window, which is
+/// The `SET`s that run after `Config.wtf` at startup: each `WTF\RunOnce*.wtf`, names sorted
+/// case-blind (`ForEveryRunOnceWTF` `0x406740`), then `Data\<locale>\realmlist.wtf` and the
+/// root's `realmlist.wtf` (`ClientServices::InitLoginServerCVars` `0x6b0bf0`).
+fn startup_extras() -> Vec<(String, String)> {
+    let mut files = crate::local_state::run_once_files();
+    if let Some(data) = benilla_formats::wow_data() {
+        if let Ok(locale) = benilla_formats::data_locale(&data) {
+            files.push(data.join(locale).join("realmlist.wtf"));
+        }
+    }
+    files.extend(crate::local_state::client_root().map(|r| r.join("realmlist.wtf")));
+    files
+        .iter()
+        .filter_map(|f| std::fs::read(f).ok())
+        .flat_map(|b| wtf::parse(&String::from_utf8_lossy(&b)))
+        .collect()
+}
+
+/// One CVar as `Config.wtf` holds it, before the `App` exists: for the primary window, which is
 /// built with its display mode resolved. Everything else reads [`Cvars::get`].
 pub(crate) fn boot_cvar(name: &str) -> Option<String> {
     match stored_config() {
         StoredConfig::Table(t) => t
             .into_iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .rfind(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v),
         StoredConfig::Absent | StoredConfig::Bad(_) => None,
     }
@@ -849,47 +970,57 @@ pub(crate) fn fold_dying_vm_cvars(world: &mut World) {
     }
 }
 
-/// The logout half of [`fold_dying_vm_cvars`]: the per-character rows go, after the fold kept the
-/// dying VM's last writes, so the next character starts from the defaults.
+/// The UI shutdown's `CVar::DeleteCharacterCVars` (`0x767350`), after the fold kept the dying
+/// VM's last writes and the character's file took them, so the next character starts from the
+/// defaults.
 pub(crate) fn drop_character_cvars(world: &mut World) {
     if let Some(mut cvars) = world.get_resource_mut::<Cvars>() {
-        cvars.drop_character_rows();
+        cvars.reset_scope(Scope::Character);
     }
 }
 
-/// The file's header comment.
-const HEADER: &str = "\
-# benilla local config — CVar values that moved off their defaults.
-# Managed by the client; hand edits are read on next launch and preserved on save.
-";
+/// Ask for `Config.wtf`'s save this frame: Enter World's (`CGlueMgr::EnterWorld` `0x4d9ed8`).
+#[derive(Message)]
+pub(crate) struct SaveConfig;
 
-/// Dirty and one quiet second since the last change: save, so a crash loses at most that second.
-fn save_config_when_quiet(mut cvars: ResMut<Cvars>) {
-    if cvars.dirty && cvars.last_change.is_none_or(|t| t.elapsed() >= SAVE_QUIET) {
+fn save_config_on_request(mut asks: MessageReader<SaveConfig>, mut cvars: ResMut<Cvars>) {
+    if asks.read().count() > 0 && cvars.dirty {
         write_config(&mut cvars);
     }
 }
 
-/// The exit frame: save whatever is still dirty, quiet second or not.
+/// The exit frame (`CVar::Destroy` `0x7673f7`): the `RunOnce*.wtf` files go first
+/// (`BeginCloseGame` `0x406b70`), then whatever is dirty is saved.
 fn save_config_on_exit(mut cvars: ResMut<Cvars>) {
+    for path in crate::local_state::run_once_files() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            warn!("config: cannot delete {}: {e}", path.display());
+        }
+    }
     if cvars.dirty {
         write_config(&mut cvars);
     }
 }
 
-/// Rewrite `config.toml` atomically from the registry, so a session with no VM saves what it
-/// changed.
+/// `CVar::SaveAll` (`0x767100`) from a world handle: the UI shutdown's, after the scoped files.
+pub(crate) fn save_config_now(world: &mut World) {
+    if let Some(mut cvars) = world.get_resource_mut::<Cvars>() {
+        if cvars.dirty {
+            write_config(&mut cvars);
+        }
+    }
+}
+
+/// Rewrite `Config.wtf` whole from the registry (`CREATE_ALWAYS`, no backup), so a session with
+/// no VM saves what it changed.
 fn write_config(cvars: &mut Cvars) {
     let Some(path) = crate::local_state::config_path() else {
         cvars.dirty = false; // hermetic/session-only: nothing to write, stop retrying
         return;
     };
     let file = cvars.compose();
-    let body = toml::to_string(&LocalConfig {
-        cvars: file.clone(),
-    })
-    .expect("string map serializes");
-    match crate::local_state::write_atomic(&path, &format!("{HEADER}{body}")) {
+    let body = wtf::compose(file.iter().map(|(n, v)| (n.as_str(), v.as_str())));
+    match crate::local_state::write_atomic(&path, &body) {
         Ok(()) => {
             cvars.file = file;
             cvars.dirty = false;
@@ -922,6 +1053,8 @@ fn publish_filter_policy(filter: Res<benilla_assets::TexFilterSetting>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::chat_bubble::BubbleConfig;
     use crate::minimap::MinimapZoom;
@@ -1574,12 +1707,14 @@ mod tests {
                 ("FutureKnob".to_string(), "3".to_string()), // a newer build's key: preserved
                 ("uiScale".to_string(), "0.8".to_string()),  // the file's own, kept as found
                 ("farclip".to_string(), "400".to_string()),  // will return to default
+                ("Sound_MusicVolume".to_string(), "0.3".to_string()),
             ]
             .into(),
         );
         cvars.set("Sound_MusicVolume", "0.7"); // moved: written
-        cvars.set("farclip", "777"); // back to default: removed
-        let out = cvars.compose();
+        cvars.set("Sound_AmbienceVolume", "0.6"); // set at its default: removed
+        cvars.set("farclip", "777"); // back to ours, which 12340 boots into over its "350"
+        let out: BTreeMap<String, String> = cvars.compose().into_iter().collect();
         assert_eq!(
             out.get("Sound_MusicVolume").map(String::as_str),
             Some("0.7")
@@ -1589,36 +1724,101 @@ mod tests {
             "at default: absent"
         );
         assert_eq!(out.get("uiScale").map(String::as_str), Some("0.8"));
-        assert!(!out.contains_key("farclip"));
+        assert!(!out.contains_key("Sound_AmbienceVolume"));
+        assert_eq!(
+            out.get("farclip").map(String::as_str),
+            Some("777"),
+            "compared with 12340's registered string, as its own file keeps the boot's value"
+        );
         assert_eq!(out.get("FutureKnob").map(String::as_str), Some("3"));
     }
 
-    /// The stat dropdowns are per-character (flags 0x20): never written to or read from the file,
-    /// kept for the session, and back at "" after a logout.
+    /// `Config.wtf` in the reference's list order: the file's names first, then the rest in
+    /// registration order; a name the file holds twice is written once, a latched stage is what is
+    /// archived, and the default compares case-blind.
     #[test]
-    fn a_per_character_row_stays_out_of_the_file_and_drops_at_logout() {
+    fn compose_keeps_the_files_order_and_archives_the_stage() {
+        let mut cvars = Cvars::default();
+        cvars.load_file(vec![
+            ("Zeta".to_string(), "1".to_string()),
+            ("Sound_MusicVolume".to_string(), "0.3".to_string()),
+            ("zeta".to_string(), "2".to_string()),
+        ]);
+        cvars.set("farclip", "500");
+        cvars.set("gxWindow", "0");
+        cvars.set("gxWindow", "1");
+        let names: Vec<String> = cvars.compose().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names[..2], ["Zeta", "Sound_MusicVolume"]);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.eq_ignore_ascii_case("zeta"))
+                .count(),
+            1
+        );
+        assert!(names.contains(&"farclip".to_string()));
+        let gx = cvars.compose().into_iter().find(|(n, _)| n == "gxWindow");
+        assert!(gx.is_none() || gx.unwrap().1 == "1");
+        let mut case = Cvars::default();
+        case.set("chatStyle", "IM");
+        assert!(
+            case.compose_scope(Scope::Account).is_empty(),
+            "IM is the default im, compared case-blind"
+        );
+    }
+
+    /// The stat dropdowns are per-character (flags 0x20): never read from or written to
+    /// `Config.wtf`, archived in the character's `config-cache.wtf`, and back at "" after the UI
+    /// shutdown drops the scope.
+    #[test]
+    fn a_per_character_row_lives_in_its_scope_file_and_drops_at_shutdown() {
         let mut cvars = Cvars::default();
         assert_eq!(cvars.get("playerStatLeftDropdown"), Some(""));
         cvars.load_file([("playerStatRightDropdown".to_string(), "X".to_string())].into());
         assert_eq!(cvars.get("playerStatRightDropdown"), Some(""), "not read");
         cvars.set("playerStatLeftDropdown", "PLAYERSTAT_SPELL_COMBAT");
+        let out: BTreeMap<String, String> = cvars.compose().into_iter().collect();
+        assert!(
+            !out.contains_key("playerStatLeftDropdown"),
+            "not in Config.wtf"
+        );
+        assert!(
+            !out.contains_key("playerStatRightDropdown"),
+            "nor the stale entry"
+        );
+        assert_eq!(
+            cvars.compose_scope(Scope::Character),
+            "SET playerStatLeftDropdown \"PLAYERSTAT_SPELL_COMBAT\"\n"
+        );
+        cvars.reset_scope(Scope::Character);
+        assert_eq!(cvars.get("playerStatLeftDropdown"), Some(""));
+        cvars.load_scope(
+            Scope::Character,
+            "SET playerStatLeftDropdown \"PLAYERSTAT_MELEE_COMBAT\"\nSET newKnob \"4\"\n",
+        );
         assert_eq!(
             cvars.get("playerStatLeftDropdown"),
-            Some("PLAYERSTAT_SPELL_COMBAT")
+            Some("PLAYERSTAT_MELEE_COMBAT"),
+            "the next login reads it back"
         );
-        let out = cvars.compose();
-        assert!(!out.contains_key("playerStatLeftDropdown"), "not written");
-        assert_eq!(
-            out.get("playerStatRightDropdown").map(String::as_str),
-            Some("X"),
-            "the file's own entry is left as found"
+        assert!(
+            cvars
+                .compose_scope(Scope::Character)
+                .contains("SET newKnob \"4\""),
+            "a name no row claims goes back to the file it came from"
         );
-        cvars.drop_character_rows();
-        assert_eq!(cvars.get("playerStatLeftDropdown"), Some(""));
+        assert!(
+            !cvars
+                .compose()
+                .iter()
+                .any(|(n, v)| n == "newKnob" && v == "4"),
+            "an unclaimed name in a scope file becomes a Config.wtf placeholder (0x768307)"
+        );
     }
 
+    /// No save on a timer: a change waits for a save point, here Enter World's.
     #[test]
-    fn a_change_saves_after_one_quiet_second_with_no_exit() {
+    fn a_change_waits_for_a_save_point() {
         use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
         let _l = ENV_LOCK
             .lock()
@@ -1630,6 +1830,7 @@ mod tests {
         let _f = EnvGuard::unset("WOW_FARCLIP");
         let _d = EnvGuard::unset("WOW_CLUTTER_DENSITY");
         let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
+        let _w = EnvGuard::set("WOW_DATA", "");
 
         let mut app = cvar_app();
         app.update();
@@ -1638,27 +1839,22 @@ mod tests {
             .run(r#"SetCVar("Sound_MusicVolume", 0.75)"#)
             .unwrap();
         app.update();
-        assert!(
-            !tmp.join("config.toml").exists(),
-            "inside the quiet second nothing is written"
-        );
-
-        // The change ages past the quiet second; no `AppExit` anywhere.
-        {
-            let mut cvars = app.world_mut().resource_mut::<Cvars>();
-            assert!(cvars.dirty);
-            cvars.last_change = Instant::now().checked_sub(SAVE_QUIET * 2);
-        }
         app.update();
-        let text = std::fs::read_to_string(tmp.join("config.toml")).unwrap();
-        assert!(text.contains("Sound_MusicVolume = \"0.75\""), "{text}");
+        assert!(
+            !tmp.join("WTF/Config.wtf").exists(),
+            "nothing between save points"
+        );
+        app.world_mut().write_message(SaveConfig);
+        app.update();
+        let text = std::fs::read_to_string(tmp.join("WTF/Config.wtf")).unwrap();
+        assert!(text.contains("SET Sound_MusicVolume \"0.75\""), "{text}");
         assert!(!app.world().resource::<Cvars>().dirty);
         assert!(app.should_exit().is_none());
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
-    fn a_lua_setcvar_lands_in_config_toml_end_to_end() {
+    fn a_lua_setcvar_lands_in_config_wtf_end_to_end() {
         use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
         let _l = ENV_LOCK
             .lock()
@@ -1670,9 +1866,10 @@ mod tests {
         let _f = EnvGuard::unset("WOW_FARCLIP");
         let _d = EnvGuard::unset("WOW_CLUTTER_DENSITY");
         let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
+        let _w = EnvGuard::set("WOW_DATA", "");
         crate::local_state::write_atomic(
-            &tmp.join("config.toml"),
-            "[cvars]\nSound_MusicVolume = \"0.1\"\n",
+            &tmp.join("WTF/Config.wtf"),
+            "SET Sound_MusicVolume \"0.1\"\n",
         )
         .unwrap();
 
@@ -1700,12 +1897,24 @@ mod tests {
         // …and the exit flush writes the diff: the moved value, nothing at its default.
         app.world_mut().write_message(AppExit::Success);
         app.update();
-        let text = std::fs::read_to_string(tmp.join("config.toml")).unwrap();
-        assert!(text.contains("Sound_MusicVolume = \"0.75\""), "{text}");
+        let text = std::fs::read_to_string(tmp.join("WTF/Config.wtf")).unwrap();
+        assert!(text.contains("SET Sound_MusicVolume \"0.75\""), "{text}");
         assert!(!text.contains("MasterVolume"), "defaults stay out:\n{text}");
-        let back: LocalConfig = toml::from_str(&text).unwrap();
-        assert_eq!(back.cvars.len(), 1, "a diff, not a dump: {text}");
+        // A diff, not a dump: past the moved value, only the rows whose default is not the string
+        // 12340 registers, which its own file carries the same way.
+        for (name, _) in wtf::parse(&text) {
+            let row = app.world().resource::<Cvars>().row(&name).cloned().unwrap();
+            assert!(
+                name == "Sound_MusicVolume" || row.default != row.archive_default,
+                "{name} written at the reference's default: {text}"
+            );
+        }
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// [`Cvars::compose`] as a map, for the tests that ask what it holds rather than its order.
+    fn composed(cvars: &Cvars) -> BTreeMap<String, String> {
+        cvars.compose().into_iter().collect()
     }
 
     /// A client with a real CVar host: every knob resource an observer writes, every observer,
@@ -1883,6 +2092,7 @@ mod tests {
         let _d = EnvGuard::unset("WOW_CLUTTER_DENSITY");
         let _w = EnvGuard::unset("WOW_CHAR");
         let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
+        let _w = EnvGuard::set("WOW_DATA", "");
         let roster = || {
             (1..=4)
                 .map(|g| crate::char_select::test_character(g, &format!("Char{g}")))
@@ -1907,9 +2117,9 @@ mod tests {
         app.world_mut().write_message(AppExit::Success);
         app.update();
 
-        let text = std::fs::read_to_string(tmp.join("config.toml")).unwrap();
+        let text = std::fs::read_to_string(tmp.join("WTF/Config.wtf")).unwrap();
         assert!(
-            text.contains("lastCharacterIndex = \"2\""),
+            text.contains("SET lastCharacterIndex \"2\""),
             "entering the world must reach the file, 0-based like Config.wtf:\n{text}"
         );
 
@@ -1939,29 +2149,22 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// `minimapZoom` is per character (`0x20`): it comes back from the character's
+    /// `config-cache.wtf` and goes out in it, never in `Config.wtf`.
     #[test]
-    fn a_minimap_setzoom_reaches_the_knob_and_the_file() {
-        use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
-        let _l = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tmp = std::env::temp_dir().join(format!("benilla-mmzoom-{}", std::process::id()));
-        std::fs::remove_dir_all(&tmp).ok();
-        let _c = EnvGuard::unset("WOW_CAPTURE");
-        let _u = EnvGuard::unset("WOW_UI_SCALE");
-        let _f = EnvGuard::unset("WOW_FARCLIP");
-        let _d = EnvGuard::unset("WOW_CLUTTER_DENSITY");
-        let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
-        // The previous session left the outdoor map zoomed right in.
-        crate::local_state::write_atomic(
-            &tmp.join("config.toml"),
-            "[cvars]\nminimapZoom = \"5\"\n",
-        )
-        .unwrap();
-
+    fn a_minimap_setzoom_reaches_the_knob_and_the_characters_file() {
         let mut app = cvar_app();
         app.update();
-
+        // The character's file says the outdoor map was zoomed right in.
+        let events = {
+            let mut cvars = app.world_mut().resource_mut::<Cvars>();
+            cvars.load_scope(Scope::Character, "SET minimapZoom \"5\"\n");
+            cvars.take_events()
+        };
+        for e in events {
+            app.world_mut().trigger(e);
+        }
+        app.update();
         assert_eq!(app.world().resource::<MinimapZoom>().outdoor, 5);
         assert_eq!(app.world().resource::<MinimapZoom>().inside, 3);
         let seed = {
@@ -1980,44 +2183,32 @@ mod tests {
         }
         app.update();
         assert_eq!(app.world().resource::<MinimapZoom>().outdoor, 3);
-
-        app.world_mut().write_message(AppExit::Success);
-        app.update();
-        let text = std::fs::read_to_string(tmp.join("config.toml")).unwrap();
+        let cvars = app.world().resource::<Cvars>();
         assert!(
-            !text.contains("minimapZoom"),
-            "back at the registered default 3, so it leaves the diff entirely:\n{text}"
+            !cvars
+                .compose_scope(Scope::Character)
+                .contains("minimapZoom"),
+            "back at the registered default 3, so it leaves the file"
         );
-
         app.world_mut()
             .non_send_resource_mut::<UiScript>()
             .run("m:SetZoom(1)")
             .unwrap();
         app.update();
-        app.world_mut().write_message(AppExit::Success);
-        app.update();
-        let text = std::fs::read_to_string(tmp.join("config.toml")).unwrap();
-        assert!(text.contains("minimapZoom = \"1\""), "{text}");
+        let cvars = app.world().resource::<Cvars>();
+        assert!(cvars
+            .compose_scope(Scope::Character)
+            .contains("SET minimapZoom \"1\""));
+        assert!(
+            !composed(cvars).contains_key("minimapZoom"),
+            "never in Config.wtf"
+        );
         assert_eq!(app.world().resource::<MinimapZoom>().outdoor, 1);
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn the_toml_round_trips() {
-        let cfg = LocalConfig {
-            cvars: [("Sound_MusicVolume".to_string(), "0.7".to_string())].into(),
-        };
-        let text = format!("{HEADER}{}", toml::to_string(&cfg).unwrap());
-        let back: LocalConfig = toml::from_str(&text).unwrap();
-        assert_eq!(back.cvars, cfg.cvars);
-        let hand = "# my note\n[cvars]\nFarclip = \"500\"\n";
-        let parsed: LocalConfig = toml::from_str(hand).unwrap();
-        assert_eq!(parsed.cvars.get("Farclip").map(String::as_str), Some("500"));
     }
 
     /// The string-valued rows, a closed list, each default checked on its own terms: `realmName`
     /// (the reference's registered `""`, `0x882748`) and `gxApi` are empty until the session writes
-    /// them; `gxResolution` and `realmList` pass their observers' parsers
+    /// them; `screenshotFormat` is `jpeg`; `gxResolution` and `realmList` pass their observers' parsers
     /// ([`crate::video::parse_resolution`], [`crate::realmlist::normalize`]).
     #[test]
     fn the_string_valued_cvars_are_the_realm_and_the_windowed_size() {
@@ -2029,7 +2220,13 @@ mod tests {
         strings.sort_unstable(); // the list is the claim, not where the rows sit in the table
         assert_eq!(
             strings,
-            vec!["gxApi", "gxResolution", "realmList", "realmName"]
+            vec![
+                "gxApi",
+                "gxResolution",
+                "realmList",
+                "realmName",
+                "screenshotFormat"
+            ]
         );
         let default_of = |name: &str| {
             REGISTERED
@@ -2040,6 +2237,11 @@ mod tests {
         };
         assert_eq!(default_of("realmName"), "");
         assert_eq!(default_of("gxApi"), "");
+        assert_eq!(
+            default_of("screenshotFormat"),
+            "jpeg",
+            "anything but tga is a JPEG"
+        );
         assert_eq!(
             default_of("gxResolution"),
             "",
@@ -2083,9 +2285,10 @@ mod tests {
             SetOutcome::Unchanged,
             "same stage"
         );
-        assert!(
-            !cvars.compose().contains_key("gxVSync"),
-            "a stage that is never committed never reaches the file"
+        assert_eq!(
+            composed(&cvars).get("gxVSync").map(String::as_str),
+            Some("0"),
+            "the archive writes the stage (`0x767077`), committed or not"
         );
         assert_eq!(cvars.commit_latched(), 1);
         assert_eq!(cvars.get("gxVSync"), Some("0"));
@@ -2100,7 +2303,7 @@ mod tests {
         );
         assert!(cvars.dirty);
         assert_eq!(
-            cvars.compose().get("gxVSync").map(String::as_str),
+            composed(&cvars).get("gxVSync").map(String::as_str),
             Some("0")
         );
         assert_eq!(
@@ -2119,7 +2322,11 @@ mod tests {
             cvars.row("SoundBufferSize").unwrap().pending.as_deref(),
             Some("200")
         );
-        assert!(!cvars.compose().contains_key("SoundBufferSize"));
+        assert_eq!(
+            composed(&cvars).get("SoundBufferSize").map(String::as_str),
+            Some("200"),
+            "uncommitted, and still the value the archive writes (`0x767077`)"
+        );
         assert_eq!(cvars.set("Sound_MusicVolume", "0.7"), SetOutcome::Changed);
         assert_eq!(cvars.get("Sound_MusicVolume"), Some("0.7"));
         assert_eq!(cvars.take_events().len(), 1);
@@ -2174,18 +2381,13 @@ mod tests {
         assert!(!cvars.dirty);
         assert_eq!(cvars.set_from_vm("myAddonKnob", "5"), SetOutcome::Changed);
         assert!(cvars.dirty, "an addon-only change is a change");
-        assert_eq!(
-            cvars.compose().get("myAddonKnob").map(String::as_str),
-            Some("5")
-        );
-        cvars.set_from_vm("myAddonKnob", "1");
         assert!(
-            !cvars.compose().contains_key("myAddonKnob"),
-            "back at the addon's default, it leaves the diff"
+            !composed(&cvars).contains_key("myAddonKnob"),
+            "an addon's row is never archived (`RegisterCVar` registers it with 0x80)"
         );
         let cvars = registry(&[("FutureKnob", "3")]);
         assert_eq!(
-            cvars.compose().get("FutureKnob").map(String::as_str),
+            composed(&cvars).get("FutureKnob").map(String::as_str),
             Some("3")
         );
     }
@@ -2194,7 +2396,7 @@ mod tests {
     fn a_session_owned_row_answers_the_env_and_never_reaches_the_file() {
         let mut cvars = Cvars::default();
         cvars.own_for_session("uiScale", Some("1.2"));
-        cvars.load_file(BTreeMap::from([("uiScale".to_string(), "0.8".to_string())]));
+        cvars.load_file(Vec::from([("uiScale".to_string(), "0.8".to_string())]));
         assert_eq!(
             cvars.get("uiScale"),
             Some("1.2"),
@@ -2206,13 +2408,13 @@ mod tests {
         );
         assert_eq!(cvars.set("uiScale", "1.4"), SetOutcome::Changed);
         assert_eq!(
-            cvars.compose().get("uiScale").map(String::as_str),
+            composed(&cvars).get("uiScale").map(String::as_str),
             Some("0.8"),
             "the file keeps what it said"
         );
         // A lever with no resource still marks the row, so the file cannot apply over the env.
         cvars.own_for_session("farclip", None);
-        cvars.load_file(BTreeMap::from([("farclip".to_string(), "500".to_string())]));
+        cvars.load_file(Vec::from([("farclip".to_string(), "500".to_string())]));
         assert_eq!(cvars.get("farclip"), Some("777"));
         assert!(cvars.is_session_owned("FARCLIP"));
     }
@@ -2221,7 +2423,7 @@ mod tests {
     #[test]
     fn a_retired_row_leaves_the_file_and_nothing_else_does() {
         let mut cvars = Cvars::default();
-        cvars.load_file(BTreeMap::from([
+        cvars.load_file(Vec::from([
             ("worlddetail".to_string(), "2".to_string()),
             ("farclip".to_string(), "500".to_string()),
             ("FutureKnob".to_string(), "3".to_string()),
@@ -2235,7 +2437,7 @@ mod tests {
             None,
             "a row is never retired"
         );
-        let file = cvars.compose();
+        let file = composed(&cvars);
         assert!(!file.keys().any(|k| k.eq_ignore_ascii_case("WorldDetail")));
         assert_eq!(file.get("farclip").map(String::as_str), Some("500"));
         assert_eq!(file.get("FutureKnob").map(String::as_str), Some("3"));
@@ -2257,9 +2459,10 @@ mod tests {
         let _d = EnvGuard::unset("WOW_CLUTTER_DENSITY");
         let _m = EnvGuard::unset("WOW_MSAA");
         let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
+        let _w = EnvGuard::set("WOW_DATA", "");
         crate::local_state::write_atomic(
-            &tmp.join("config.toml"),
-            "[cvars]\nSound_MusicVolume = \"0.1\"\ngxMultisample = \"4\"\n",
+            &tmp.join("WTF/Config.wtf"),
+            "SET Sound_MusicVolume \"0.1\"\nSET gxMultisample \"4\"\n",
         )
         .unwrap();
         #[derive(Resource, Default)]

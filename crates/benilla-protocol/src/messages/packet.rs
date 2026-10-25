@@ -468,9 +468,15 @@ pub enum ServerPacket {
     ItemQueryResponse {
         entry: u32,
         info: Option<Box<ItemInfo>>,
-        /// The body as received, which the item cache keeps and decodes again on load.
-        body: Vec<u8>,
     },
+    /// `SMSG_CLIENTCACHE_VERSION`: the server's cache version, which the `.wdb` files carry.
+    ClientCacheVersion {
+        version: u32,
+    },
+    /// `SMSG_ACCOUNT_DATA_TIMES`: the server's time per account-data slot.
+    AccountDataTimes(super::AccountDataTimes),
+    /// `SMSG_UPDATE_ACCOUNT_DATA`: one slot's bytes, compressed.
+    AccountDataUpdate(super::AccountDataUpdate),
     /// `SMSG_MESSAGECHAT`: one chat line; GM dot-commands answer as system lines (type `0x0A`).
     MessageChat(ChatMessage),
     /// `SMSG_CHANNEL_NOTIFY`: a channel join, leave, error or moderation notice.
@@ -1496,6 +1502,9 @@ impl ServerPacket {
             ServerPacket::TextEmote { .. } => "SMSG_TEXT_EMOTE".into(),
             ServerPacket::Emote { .. } => "SMSG_EMOTE".into(),
             ServerPacket::ItemQueryResponse { .. } => "SMSG_ITEM_QUERY_SINGLE_RESPONSE".into(),
+            ServerPacket::ClientCacheVersion { .. } => "SMSG_CLIENTCACHE_VERSION".into(),
+            ServerPacket::AccountDataTimes(_) => "SMSG_ACCOUNT_DATA_TIMES".into(),
+            ServerPacket::AccountDataUpdate(_) => "SMSG_UPDATE_ACCOUNT_DATA".into(),
             ServerPacket::InventoryChangeFailure { .. } => "SMSG_INVENTORY_CHANGE_FAILURE".into(),
             ServerPacket::MessageChat(_) => "SMSG_MESSAGECHAT".into(),
             ServerPacket::ChannelNotify(_) => "SMSG_CHANNEL_NOTIFY".into(),

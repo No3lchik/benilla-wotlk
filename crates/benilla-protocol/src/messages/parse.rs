@@ -717,13 +717,26 @@ fn parse_server_body(
             ServerPacket::Emote { guid, emote_id }
         }
         opcode::SMSG_ITEM_QUERY_SINGLE_RESPONSE => {
-            let body = r.to_vec();
             let (entry, info) = items::read_item_query_response_wotlk(&mut r)?;
             ServerPacket::ItemQueryResponse {
                 entry,
                 info: info.map(Box::new),
-                body,
             }
+        }
+        opcode::SMSG_CLIENTCACHE_VERSION => ServerPacket::ClientCacheVersion {
+            version: read_u32_le(&mut r)?,
+        },
+        opcode::SMSG_ACCOUNT_DATA_TIMES => {
+            ServerPacket::AccountDataTimes(super::read_account_data_times(&mut r)?)
+        }
+        opcode::SMSG_UPDATE_ACCOUNT_DATA => {
+            ServerPacket::AccountDataUpdate(super::read_update_account_data(&mut r)?)
+        }
+        // Slot and result, which the reference reads and ignores (`0x6b8fc0`).
+        opcode::SMSG_UPDATE_ACCOUNT_DATA_COMPLETE => {
+            read_u32_le(&mut r)?;
+            read_u32_le(&mut r)?;
+            ServerPacket::Other { opcode }
         }
         opcode::SMSG_MESSAGECHAT => {
             ServerPacket::MessageChat(chat::read_message_chat_wotlk(&mut r, false)?)

@@ -132,9 +132,14 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 position: [position.x, position.y, position.z],
             }]
         }
-        ServerPacket::ItemQueryResponse { entry, info, body } => {
-            vec![SessionEvent::ItemTemplate { entry, info, body }]
+        ServerPacket::ItemQueryResponse { entry, info } => {
+            vec![SessionEvent::ItemTemplate { entry, info }]
         }
+        ServerPacket::ClientCacheVersion { version } => {
+            vec![SessionEvent::ClientCacheVersion { version }]
+        }
+        ServerPacket::AccountDataTimes(t) => vec![SessionEvent::AccountDataTimes(t)],
+        ServerPacket::AccountDataUpdate(u) => vec![SessionEvent::AccountDataUpdate(u)],
         ServerPacket::MessageChat(m) => vec![SessionEvent::Chat(m)],
         ServerPacket::ChannelNotify(n) => vec![SessionEvent::ChannelNotify {
             notice: n.notice,

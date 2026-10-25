@@ -238,6 +238,13 @@ fn ui_wanted(world: &World) -> bool {
 #[derive(Resource, Default)]
 pub(crate) struct PendingEntryUiLoad;
 
+/// How long the entry load waits for the account data before it loads the local files.
+const ACCOUNT_DATA_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// When the entry load began waiting for the account data.
+#[derive(Resource, Clone, Copy)]
+struct AccountDataWait(std::time::Instant);
+
 /// The boot VM, parked between the world-entry edge and the deferred load, out of every feed's
 /// reach: each feed takes the VM as an `Option` and returns on `None`.
 pub(crate) struct ParkedBootVm(UiScript);
@@ -317,6 +324,18 @@ pub(crate) fn run_pending_entry_load(world: &mut World) {
     {
         return;
     }
+    // The account data first: the loads wait for the server's times and any download.
+    // Deviation: past `ACCOUNT_DATA_WAIT` the UI loads on the local files, where the reference
+    // waits for good and never fires `VARIABLES_LOADED`, so a silent server costs no UI.
+    if !crate::account_data::ready_for_ui(world) {
+        let since =
+            *world.get_resource_or_insert_with(|| AccountDataWait(std::time::Instant::now()));
+        if since.0.elapsed() < ACCOUNT_DATA_WAIT {
+            return;
+        }
+        warn!("ui_script: no account data times from the server — the UI loads the local files");
+    }
+    world.remove_resource::<AccountDataWait>();
     world.remove_resource::<PendingEntryUiLoad>();
     let start = std::time::Instant::now();
     load_ingame_ui_on_world_entry(world);
@@ -376,6 +395,9 @@ pub(crate) fn load_ingame_ui_on_world_entry(world: &mut World) {
         return;
     }
     mint_entry_vm(world);
+    // The account's and the character's `config-cache.wtf` before the UI reads a CVar
+    // (`LoadAccountVariables` `0x518c80` in `InitializeFrameXML`).
+    crate::account_data::load_config_slots(world);
     let Some(mut script) = world.remove_non_send_resource::<UiScript>() else {
         warn!("ui_script: entering the world with no VM — the in-game UI will not load");
         return;
@@ -490,6 +512,7 @@ pub(crate) fn load_ingame_ui_on_world_entry(world: &mut World) {
         // events (`ChatFrame.lua:1261-1273`).
         finish_ui_load_with(
             script,
+            identity.as_ref(),
             // Before `VARIABLES_LOADED`: the minimap's town type restores there
             // (`LoadTrackedState 0x5128d0`).
             |script| script.load_tracked_state(class_id),
@@ -667,14 +690,13 @@ pub(crate) fn arm_leaving_world_on_self_create(
 }
 
 /// The UI shutdown in the reference's order, `0x490bd0`'s tail: `PLAYER_LEAVING_WORLD` (273) →
-/// `PLAYER_LOGOUT` (271, `0x490c2a`) → `layout-cache.txt` → the flat saved file (`0x490c7e`) →
+/// `PLAYER_LOGOUT` (271, `0x490c2a`) → the two `SavedVariables.lua` files (`0x490c7e`) →
 /// the per-addon files (`0x490c83`) → `AddOns.txt` (`0x490c88`) → destroy the frame-script owner
 /// (`0x490c97`) → nil all 216 C bindings out of `_G` (`0x490cba` → `0x490ce0`).
 ///
 /// `PLAYER_LOGOUT` fires before any write, an addon's last chance to change a saved global. One
-/// function on every root because the steps are ordered against each other; the layout save is
-/// here because a `/reload` never leaves `InWorld`. No autosave, as the reference has none (the
-/// layout cache's crash-only debounce in [`crate::ui_layout`] is ours).
+/// function on every root because the steps are ordered against each other. No autosave, as the
+/// reference has none.
 pub(crate) fn shutdown_ui_state(
     script: &mut UiScript,
     identity: Option<&(String, String)>,
@@ -687,8 +709,7 @@ pub(crate) fn shutdown_ui_state(
         script.fire_event("PLAYER_LEAVING_WORLD", vec![]);
     }
     script.fire_event("PLAYER_LOGOUT", vec![]);
-    crate::ui_layout::save_now(script, identity);
-    crate::ui_saved::save(script);
+    crate::ui_saved::save(script, identity);
     addons::save_addon_variables(script, identity);
     addons::save_enable_state(script, identity);
 }
@@ -701,6 +722,7 @@ pub(crate) fn shutdown_ui_state(
 /// ([`install_glue_side_vm`]).
 pub(crate) fn end_ui_session(world: &mut World) {
     close_ui_session(world);
+    crate::account_data::release_character(world);
     // `0x401ee0`'s glue leg: `"charselect"` after a logout, `"login"` after a disconnect
     // (`0x402084`); the state this exit enters says which.
     let screen = match world
@@ -733,9 +755,13 @@ fn close_ui_session(world: &mut World) {
     // After the shutdown events (a `PLAYER_LOGOUT` handler may `SetCVar`, which in the reference
     // lands in an engine-side store that survives) and before the VM is replaced.
     crate::cvars::fold_dying_vm_cvars(world);
-    crate::cvars::drop_character_cvars(world);
-    // The chat cache folds here, not in its own `OnExit(InWorld)` system, which a `/reload` skips.
-    crate::ui_chat::settings::fold_dying_vm_chat_cache(world);
+    // The scoped CVar files, `Config.wtf`, the character's rows dropped, the uploads: a UI that
+    // never loaded saves no slot, which would write its defaults over the files.
+    if ui_never_loaded {
+        crate::cvars::drop_character_cvars(world);
+    } else {
+        crate::account_data::save_ui(world);
+    }
     world.insert_resource(AddOnIdentity(None));
 
     // Host values taken from the dying frame tree go with it (a `VmMemo` resets on its own): the
@@ -858,7 +884,7 @@ pub(crate) fn shutdown_on_exit(
 /// the self descriptor lands.
 #[cfg(test)]
 pub(crate) fn finish_ui_load(script: &mut UiScript) {
-    finish_ui_load_with(script, |_| {}, |_| {});
+    finish_ui_load_with(script, None, |_| {}, |_| {});
 }
 
 /// [`finish_ui_load`] with its two host seams. `host_settings` runs between the saved-variables
@@ -870,13 +896,14 @@ pub(crate) fn finish_ui_load(script: &mut UiScript) {
 /// returned. Either way a `VARIABLES_LOADED` handler sees the boot chat colours, not the file's.
 pub(crate) fn finish_ui_load_with(
     script: &mut UiScript,
+    identity: Option<&(String, String)>,
     host_settings: impl FnOnce(&mut UiScript),
     between: impl FnOnce(&mut UiScript),
 ) {
     // Still the load edge, so still bounded: re-armed so the saved variables and every
     // `PLAYER_LOGIN` handler get the full allowance; the entry edge disarms it after.
     script.set_instruction_budget(addons::LOAD_INSTRUCTION_BUDGET);
-    crate::ui_saved::load_saved_variables(script, host_settings);
+    crate::ui_saved::load_saved_variables(script, identity, host_settings);
     between(script);
     script.fire_event("PLAYER_LOGIN", vec![]);
 }

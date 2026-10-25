@@ -1,11 +1,19 @@
-//! Where benilla keeps local state: one folder, `benilla-config/`, never inside the install, and
-//! this module is the only place that computes a path into it; each path fn's doc says what it
-//! holds. The 1.12 client is portable the same way, its `WTF/` and `Cache/` in its own folder.
+//! Where benilla keeps local state, and the only place that computes a path into it; each path
+//! fn's doc says what it holds.
 //!
-//! Resolution, in order, the same shape as [`benilla_formats::wow_data`]:
+//! What the reference writes, benilla writes in the reference's format at the reference's path
+//! (`WTF\`, `Cache\WDB\`, `Logs\`, `Screenshots\`, addons read from `Interface\AddOns\`), under
+//! one of two roots ([`client_root`]):
+//! - **the install**, for a drop-in `Wow.exe` (the `standalone` launcher, [`drop_in_install`]),
+//!   so the reference client and benilla take turns on one folder;
+//! - **`benilla-config/`** ([`home`]) in every other build, which never writes into the install.
+//!
+//! What the reference has no file for (benilla's diagnostics, the probe leases) lives in
+//! [`home`] itself, `<install>/benilla-config/` for the drop-in. [`home`] resolves, in order, the
+//! same shape as [`benilla_formats::wow_data`]:
 //! 1. `$BENILLA_HOME`.
-//! 2. `<project folder>/benilla-config/`, dev builds only ([`benilla_formats::project_folder`], the
-//!    launcher's): a shipped binary must not carry the build machine's source tree.
+//! 2. `<project folder>/benilla-config/`, dev builds only ([`benilla_formats::project_folder`],
+//!    the launcher's): a shipped binary must not carry the build machine's source tree.
 //! 3. `<exe dir>/benilla-config/`.
 //!
 //! With `$WOW_CAPTURE` set every path resolves to `None`: a capture neither reads nor writes
@@ -32,6 +40,25 @@ pub(crate) fn home() -> Option<PathBuf> {
         return None; // a unit test reaches no real state folder unless it pins `$BENILLA_HOME`
     }
     resident_home()
+}
+
+/// The install a drop-in `Wow.exe` replaces the reference in, which it writes into as the reference
+/// does; `None` in every other build, whatever folder it runs from, and on a capture run. A unit
+/// test names one with `$BENILLA_TEST_DROP_IN`.
+pub(crate) fn drop_in_install() -> Option<PathBuf> {
+    if std::env::var_os("WOW_CAPTURE").is_some() {
+        return None;
+    }
+    if cfg!(test) {
+        return std::env::var_os("BENILLA_TEST_DROP_IN").map(PathBuf::from);
+    }
+    benilla_formats::drop_in_install().map(Path::to_path_buf)
+}
+
+/// The root the reference's own files hang off: a drop-in's install, else [`home`]. `None` when
+/// persistence is off.
+pub(crate) fn client_root() -> Option<PathBuf> {
+    drop_in_install().or_else(home)
 }
 
 /// Steps 2 and 3 of [`home`]: the folder the build itself lives in.
@@ -79,122 +106,140 @@ fn shared_root(here: &Path) -> PathBuf {
     here.to_path_buf()
 }
 
-/// `benilla-config/config.toml`: the CVar overrides, the `Config.wtf` analog.
+/// `WTF\Config.wtf`: the CVars archived outside any account (`CVar::SaveAll` `0x767100`).
 pub(crate) fn config_path() -> Option<PathBuf> {
-    home().map(|h| h.join("config.toml"))
+    client_root().map(|r| r.join("WTF").join("Config.wtf"))
 }
 
-/// `benilla-config/macros/account.txt`: the account-wide macro tab (indices 1..=18).
-pub(crate) fn macros_account_path() -> Option<PathBuf> {
-    home().map(|h| h.join("macros/account.txt"))
+/// `WTF\RunOnce*.wtf`, names sorted case-blind (`ForEveryRunOnceWTF` `0x406740`): run once after
+/// `Config.wtf` at startup, deleted at exit.
+pub(crate) fn run_once_files() -> Vec<PathBuf> {
+    let Some(dir) = client_root().map(|r| r.join("WTF")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_file()
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    let n = n.to_ascii_lowercase();
+                    n.starts_with("runonce") && n.ends_with(".wtf")
+                })
+        })
+        .collect();
+    files.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+    files
 }
 
-/// `benilla-config/macros/<realm>-<character>.txt`: the per-character macro tab (19..=36), the
-/// reference's `WTF/Account/<ACC>/<REALM>/<CHAR>/macros-cache.txt` flattened into one folder.
-pub(crate) fn macros_character_path(realm: &str, character: &str) -> Option<PathBuf> {
-    let key = format!("{}-{}", file_token(realm), file_token(character));
-    home().map(|h| h.join("macros").join(format!("{key}.txt")))
+/// `WTF\Account\<ACCOUNT>\` (`OpenAccountFile` `0x6b8b90`): the account's account-data files
+/// ([`crate::account_data`]) and saved variables. `account` is the upper-cased login name.
+pub(crate) fn account_dir(account: &str) -> Option<PathBuf> {
+    Some(
+        client_root()?
+            .join("WTF")
+            .join("Account")
+            .join(wtf_component(account)),
+    )
 }
 
-/// `benilla-config/bindings/account.txt`: the account-wide key bindings (the `bindings-cache.wtf`
-/// analog), a diff against the defaults.
-pub(crate) fn bindings_account_path() -> Option<PathBuf> {
-    home().map(|h| h.join("bindings/account.txt"))
+/// `WTF\Account\<ACCOUNT>\<Realm>\<Character>\`, the character's (`0x9f6270`), its realm and name
+/// raw as the reference's folders are.
+pub(crate) fn character_dir(account: &str, realm: &str, character: &str) -> Option<PathBuf> {
+    Some(
+        account_dir(account)?
+            .join(wtf_component(realm))
+            .join(wtf_component(character)),
+    )
 }
 
-/// `benilla-config/bindings/<realm>-<character>.txt`: the character-specific binding set. Its
-/// existence is the "character specific key bindings" state; going back to general deletes it.
-pub(crate) fn bindings_character_path(realm: &str, character: &str) -> Option<PathBuf> {
-    let key = format!("{}-{}", file_token(realm), file_token(character));
-    home().map(|h| h.join("bindings").join(format!("{key}.txt")))
+/// The logged-in account, upper-cased as the reference keeps it (`CGlueMgr::LoginServerLogin`
+/// `0x4d8a30` upper-cases `m_accountName` before the logon; `s_addOnAccountName` `0xc24418`): the
+/// `<ACCOUNT>` of every `WTF\Account` path the UI's files take.
+static ACCOUNT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Name the logged-in account, at the world server's accept.
+pub(crate) fn set_account(name: &str) {
+    *ACCOUNT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(name.to_ascii_uppercase());
 }
 
-/// `benilla-config/saved-variables.lua`: the flat channel our FrameXML saves through
-/// `RegisterForSave` (the `SavedVariables.lua` analog), written whole at logout, run at UI load.
+/// The account the test harness logs in on, which every test's `WTF\Account` paths are under.
+#[cfg(test)]
+pub(crate) const TEST_ACCOUNT: &str = "TESTACCT";
+
+/// The logged-in account's folder name, `None` before any login.
+#[cfg(not(test))]
+pub(crate) fn account() -> Option<String> {
+    ACCOUNT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Tests share one process, so every one runs on [`TEST_ACCOUNT`].
+#[cfg(test)]
+pub(crate) fn account() -> Option<String> {
+    Some(TEST_ACCOUNT.into())
+}
+
+/// `WTF\Account\<ACCOUNT>\SavedVariables.lua` (`0x9ff08c`): FrameXML's `RegisterForSave` globals.
 pub(crate) fn saved_variables_path() -> Option<PathBuf> {
-    home().map(|h| h.join("saved-variables.lua"))
+    Some(account_dir(&account()?)?.join("SavedVariables.lua"))
 }
 
-/// `benilla-config/addons/<Realm>-<Character>.txt`: the AddOn enable state, per character in the
-/// reference's `AddOns.txt` format (`<AddOnName>: enabled|disabled`), which it writes at the tail
-/// of its UI shutdown (`0x490bd0`). An addon absent from the file is enabled.
+/// `WTF\Account\<ACCOUNT>\<Realm>\<Character>\SavedVariables.lua` (`0x9f6270`): FrameXML's
+/// `RegisterForSavePerCharacter` globals.
+pub(crate) fn saved_variables_character_path(realm: &str, character: &str) -> Option<PathBuf> {
+    Some(character_dir(&account()?, realm, character)?.join("SavedVariables.lua"))
+}
+
+/// `WTF\Account\<ACCOUNT>\<Realm>\<Character>\AddOns.txt` (`0xa1da48`): the character's AddOn
+/// enable state, `<AddOnName>: enabled|disabled` a line, written at the UI shutdown (`0x5f76a0`).
 pub(crate) fn addons_state_path(realm: &str, character: &str) -> Option<PathBuf> {
-    let key = format!("{}-{}", file_token(realm), file_token(character));
-    home().map(|h| h.join("addons").join(format!("{key}.txt")))
+    Some(character_dir(&account()?, realm, character)?.join("AddOns.txt"))
 }
 
-/// `benilla-config/saved/`: per-addon saved variables, account scope, one `<Addon>.lua` per addon
-/// declaring `## SavedVariables` (the reference's `WTF/Account/<ACC>/SavedVariables/<Addon>.lua`).
+/// `WTF\Account\<ACCOUNT>\AddOns.txt` (`0xa1da2c`): the account-wide enable state, read only
+/// for a character with no file of its own; 12340 never writes it.
+pub(crate) fn addons_state_account_path() -> Option<PathBuf> {
+    Some(account_dir(&account()?)?.join("AddOns.txt"))
+}
+
+/// `WTF\Account\<ACCOUNT>\SavedVariables\` (`0xa1d83c`): an addon's `## SavedVariables`, one
+/// `<AddOn>.lua` each.
 pub(crate) fn addon_saved_account_dir() -> Option<PathBuf> {
-    home().map(|h| h.join("saved"))
+    Some(account_dir(&account()?)?.join("SavedVariables"))
 }
 
-/// `benilla-config/saved/<Realm>-<Character>/`: per-addon saved variables, character scope
-/// (`## SavedVariablesPerCharacter`), loaded after the account file so it wins.
+/// `WTF\Account\<ACCOUNT>\<Realm>\<Character>\SavedVariables\` (`0xa1d810`): an addon's
+/// `## SavedVariablesPerCharacter`, loaded after the account file so it wins.
 pub(crate) fn addon_saved_character_dir(realm: &str, character: &str) -> Option<PathBuf> {
-    let key = format!("{}-{}", file_token(realm), file_token(character));
-    home().map(|h| h.join("saved").join(key))
+    Some(character_dir(&account()?, realm, character)?.join("SavedVariables"))
 }
 
-/// `benilla-config/camera/<realm>-<character>.txt`: the third-person camera pose (the
-/// `<Char>/camera-settings.txt` analog), two lines in the reference's keys and order.
-pub(crate) fn camera_character_path(realm: &str, character: &str) -> Option<PathBuf> {
-    let key = format!("{}-{}", file_token(realm), file_token(character));
-    home().map(|h| h.join("camera").join(format!("{key}.txt")))
-}
-
-/// `benilla-config/account`: the account name the login screen remembers
-/// (`GetSavedAccountName`/`SetSavedAccountName`; the reference's is `Config.wtf`'s `accountName`).
-pub(crate) fn saved_account_path() -> Option<PathBuf> {
-    home().map(|h| h.join("account"))
-}
-
-/// `benilla-config/chat/<realm>-<character>.txt`: the chat windows' tint, alpha, font size and
-/// lock, the four the reference keeps in its per-character `chat-cache.txt`.
-pub(crate) fn chat_character_path(realm: &str, character: &str) -> Option<PathBuf> {
-    Some(home()?.join("chat").join(format!(
-        "{}-{}.txt",
-        file_token(realm),
-        file_token(character)
-    )))
-}
-
-/// `benilla-config/layout/<realm>-<character>.txt`: the layout cache, the geometry of every
-/// user-placed frame, as the reference's per-character `layout-cache.txt`; [`crate::ui_layout`]
-/// owns the shape.
-pub(crate) fn layout_character_path(realm: &str, character: &str) -> Option<PathBuf> {
-    Some(home()?.join("layout").join(format!(
-        "{}-{}.txt",
-        file_token(realm),
-        file_token(character)
-    )))
-}
-
-/// `benilla-config/cache/<realm>.tsv`: the player, creature and pet names the server has answered,
-/// one file for the reference's `WDB/namecache.wdb`, `creaturecache.wdb` and `petnamecache.wdb`.
-///
-/// Realm-scoped, where the reference's is not: guids, creature entries and pet numbers are
-/// realm-local, so one shared file would serve a realm another realm's names.
-pub(crate) fn name_cache_path(realm: &str) -> Option<PathBuf> {
+/// `WTF\Account\<ACCOUNT>\<Character>\SavedVariables\` (`0xa1d7e8`), the realm-less folder of
+/// older clients: 12340 only deletes from it.
+pub(crate) fn addon_saved_legacy_dir(character: &str) -> Option<PathBuf> {
     Some(
-        home()?
-            .join("cache")
-            .join(format!("{}.tsv", file_token(realm))),
+        account_dir(&account()?)?
+            .join(wtf_component(character))
+            .join("SavedVariables"),
     )
 }
 
-/// `benilla-config/cache/<realm>-items.tsv`: [`crate::item_persist`]'s `itemcache.wdb`.
-pub(crate) fn item_cache_path(realm: &str) -> Option<PathBuf> {
-    Some(
-        home()?
-            .join("cache")
-            .join(format!("{}-items.tsv", file_token(realm))),
-    )
+/// `Cache\WDB\<locale>\` (`GetCacheDirectory` `0x667ef0`): the query caches' `.wdb` files
+/// ([`crate::wdb`]), one set per install as the reference keeps them.
+pub(crate) fn wdb_dir(locale: &str) -> Option<PathBuf> {
+    client_root().map(|r| r.join("Cache").join("WDB").join(file_token(locale)))
 }
 
-/// `benilla-config/Logs/`: `WoWChatLog.txt` and `WoWCombatLog.txt`, the reference's names.
+/// `Logs\` (`0x9fa4e4`, `0xa02ef8`): `WoWChatLog.txt`, `WoWCombatLog.txt` and `FrameXML.log`.
 pub(crate) fn logs_dir() -> Option<PathBuf> {
-    home().map(|h| h.join("Logs"))
+    client_root().map(|r| r.join("Logs"))
 }
 
 /// `benilla-config/shots.txt`: the framing instrument's camera poses (`/shot`, dev builds).
@@ -202,13 +247,15 @@ pub(crate) fn shots_path() -> Option<PathBuf> {
     home().map(|h| h.join("shots.txt"))
 }
 
-/// `benilla-config/Screenshots/`: where the print-screen key writes, each image once, not through
-/// [`write_atomic`].
-///
-/// Deviation: the reference writes `Screenshots\\` inside the install, which benilla never writes
-/// to; the folder keeps the reference's name.
+/// `Screenshots\` (`CaptureScreen` `0x4a85c1`): where the print-screen key writes, each image once,
+/// not through [`write_atomic`].
 pub(crate) fn screenshots_dir() -> Option<PathBuf> {
-    home().map(|h| h.join("Screenshots"))
+    client_root().map(|r| r.join("Screenshots"))
+}
+
+/// `Interface\AddOns\`: where third-party addons are read from, with their art and fonts.
+pub(crate) fn addons_dir() -> Option<PathBuf> {
+    client_root().map(|r| r.join("Interface").join("AddOns"))
 }
 
 /// `benilla-config/Diagnostics/`: the stuck-thread sampler's profiles ([`crate::perf::stall`]) and
@@ -255,6 +302,24 @@ fn file_token(s: &str) -> String {
     }
 }
 
+/// A name as the one path component the reference makes of it, kept as typed but for what no
+/// folder name can hold: a path separator, a reserved Windows character or a control byte.
+fn wtf_component(s: &str) -> String {
+    let t: String = s
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    if t.trim_matches(['.', ' ']).is_empty() {
+        "unknown".into()
+    } else {
+        t
+    }
+}
+
 /// Write a state file atomically, through `<path>.tmp` and a rename, so a crash leaves the old
 /// file intact.
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
@@ -273,6 +338,28 @@ pub(crate) fn write_atomic_bytes(path: &Path, contents: &[u8]) -> std::io::Resul
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)
+}
+
+/// A path under [`client_root`] as the reference prints it: root-relative, `\`-separated.
+pub(crate) fn client_relative(path: &Path) -> String {
+    let rel = client_root()
+        .and_then(|r| path.strip_prefix(r).ok().map(Path::to_path_buf))
+        .unwrap_or_else(|| path.to_path_buf());
+    rel.to_string_lossy().replace('/', "\\")
+}
+
+/// Write a saved-variables file as 12340 does (`CGGameUI::SaveSavedVariables` `0x5271da`,
+/// `UnloadAddOns` `0x5f5721`): an existing file first moves to `<path>.bak` through `MoveFileA`,
+/// which fails once a `.bak` exists, so the backup is the first file ever replaced and is never
+/// refreshed; then the file is written whole.
+pub(crate) fn write_saved_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut bak = path.as_os_str().to_owned();
+    bak.push(".bak");
+    let bak = PathBuf::from(bak);
+    if path.exists() && !bak.exists() {
+        let _ = std::fs::rename(path, &bak);
+    }
+    write_atomic_bytes(path, contents)
 }
 
 /// Test plumbing for the persistence env vars: `set_var` is process-global, so every such test
@@ -342,41 +429,29 @@ mod tests {
         let _c = EnvGuard::unset("WOW_CAPTURE");
         let _h = EnvGuard::set("BENILLA_HOME", tmp.join(STATE_DIR).to_str().unwrap());
         assert_eq!(home(), Some(tmp.join(STATE_DIR)));
-        assert_eq!(config_path(), Some(tmp.join("benilla-config/config.toml")));
         assert_eq!(
-            macros_account_path(),
-            Some(tmp.join("benilla-config/macros/account.txt"))
+            config_path(),
+            Some(tmp.join("benilla-config").join("WTF").join("Config.wtf"))
+        );
+        assert_eq!(
+            character_dir("PROBE1", "Hydraxian Waterlords", "Probeone"),
+            Some(tmp.join("benilla-config/WTF/Account/PROBE1/Hydraxian Waterlords/Probeone")),
+            "the realm's and the character's raw names, as the reference's folders"
+        );
+        assert_eq!(
+            account_dir("../X"),
+            Some(tmp.join("benilla-config/WTF/Account/.._X")),
+            "no name can leave the folder"
         );
         assert_eq!(
             saved_variables_path(),
-            Some(tmp.join("benilla-config/saved-variables.lua"))
+            Some(tmp.join("benilla-config/WTF/Account/TESTACCT/SavedVariables.lua"))
         );
         assert_eq!(
-            macros_character_path("Hydraxian Waterlords", "Probeone"),
-            Some(tmp.join("benilla-config/macros/Hydraxian_Waterlords-Probeone.txt"))
-        );
-        assert_eq!(
-            macros_character_path("../evil", "a/b"),
-            Some(tmp.join("benilla-config/macros/___evil-a_b.txt")),
-            "no name can escape the folder"
-        );
-        assert_eq!(
-            camera_character_path("Hydraxian Waterlords", "Probeone"),
-            Some(tmp.join("benilla-config/camera/Hydraxian_Waterlords-Probeone.txt"))
-        );
-        assert_eq!(
-            chat_character_path("Hydraxian Waterlords", "Probeone"),
-            Some(tmp.join("benilla-config/chat/Hydraxian_Waterlords-Probeone.txt"))
-        );
-        assert_eq!(
-            layout_character_path("Hydraxian Waterlords", "Probeone"),
-            Some(tmp.join("benilla-config/layout/Hydraxian_Waterlords-Probeone.txt"))
+            addon_saved_legacy_dir("Probeone"),
+            Some(tmp.join("benilla-config/WTF/Account/TESTACCT/Probeone/SavedVariables"))
         );
 
-        assert_eq!(
-            saved_account_path(),
-            Some(tmp.join("benilla-config/account"))
-        );
         assert_eq!(shots_path(), Some(tmp.join("benilla-config/shots.txt")));
         assert_eq!(
             screenshots_dir(),
@@ -386,28 +461,58 @@ mod tests {
         // 0 · a capture run resolves nothing, even with an override set.
         let _c2 = EnvGuard::set("WOW_CAPTURE", "ui-options");
         assert_eq!(home(), None);
-        assert_eq!(
-            saved_account_path(),
-            None,
-            "a capture reads no saved account"
-        );
         assert_eq!(shots_path(), None);
         assert_eq!(
             screenshots_dir(),
             None,
             "a capture writes no player screenshots"
         );
-        assert_eq!(
-            chat_character_path("Hydraxian Waterlords", "Probeone"),
-            None,
-            "a capture reads no player's chat look"
-        );
-        assert_eq!(
-            layout_character_path("Hydraxian Waterlords", "Probeone"),
-            None,
-            "a capture reads no player's window layout"
-        );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// One layout, two roots: the drop-in writes the reference's folders inside its install, every
+    /// other build the same folders in `benilla-config/`, and a capture neither.
+    #[test]
+    fn only_the_drop_in_writes_into_the_install() {
+        let _l = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!("benilla-dropin-{}", std::process::id()));
+        let state = tmp.join(STATE_DIR);
+        let install = tmp.join("wow");
+        let _c = EnvGuard::unset("WOW_CAPTURE");
+        let _h = EnvGuard::set("BENILLA_HOME", state.to_str().unwrap());
+
+        let _d = EnvGuard::unset("BENILLA_TEST_DROP_IN");
+        assert_eq!(drop_in_install(), None);
+        assert_eq!(
+            benilla_formats::drop_in_install(),
+            None,
+            "only a standalone launcher records an install to write"
+        );
+        assert_eq!(client_root(), Some(state.clone()));
+        assert_eq!(logs_dir(), Some(state.join("Logs")));
+        assert_eq!(screenshots_dir(), Some(state.join("Screenshots")));
+        assert_eq!(addons_dir(), Some(state.join("Interface").join("AddOns")));
+
+        let _d2 = EnvGuard::set("BENILLA_TEST_DROP_IN", install.to_str().unwrap());
+        assert_eq!(drop_in_install(), Some(install.clone()));
+        assert_eq!(client_root(), Some(install.clone()));
+        assert_eq!(logs_dir(), Some(install.join("Logs")));
+        assert_eq!(screenshots_dir(), Some(install.join("Screenshots")));
+        assert_eq!(addons_dir(), Some(install.join("Interface").join("AddOns")));
+        assert_eq!(
+            home(),
+            Some(state.clone()),
+            "what the reference has no file for stays in benilla's folder"
+        );
+
+        let _c2 = EnvGuard::set("WOW_CAPTURE", "ui-options");
+        assert_eq!(drop_in_install(), None, "a capture writes no install");
+        assert_eq!(client_root(), None);
+        assert_eq!(logs_dir(), None);
+        assert_eq!(screenshots_dir(), None);
+        assert_eq!(addons_dir(), None);
     }
 
     /// A unit test that does not pin `$BENILLA_HOME` resolves no state folder, so no test can write

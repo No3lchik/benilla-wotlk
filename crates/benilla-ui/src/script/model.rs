@@ -363,8 +363,6 @@ pub(crate) struct Model {
     pub(crate) logging_chat: bool,
     pub(crate) logging_combat: bool,
     pub(crate) logging_changed: bool,
-    /// A user-placed frame moved or resized, or `SetUserPlaced` ran: the layout cache's save cue.
-    pub(crate) user_placed_changed: bool,
     /// The default chat language; `None` is no player, so `GetDefaultLanguage()` returns nothing.
     pub(crate) default_language: Option<String>,
     /// `AcceptDuel`, `CancelDuel` and `StartDuel` calls; Lua sees duels only through events.
@@ -458,6 +456,8 @@ pub(crate) struct Model {
 
     /// Globals `RegisterForSave` declared, in order: written at logout and re-run at load.
     pub(crate) saved_names: Vec<String>,
+    /// Globals `RegisterForSavePerCharacter` declared, in order: the character's file.
+    pub(crate) saved_names_per_character: Vec<String>,
     /// Saved-variables files that failed to load; the shutdown write leaves them untouched.
     pub(crate) held_saved_files: Vec<std::path::PathBuf>,
 
@@ -1288,7 +1288,6 @@ impl Model {
             logging_chat: false,
             logging_combat: false,
             logging_changed: false,
-            user_placed_changed: false,
             default_language: None,
             duel_requests: Vec::new(),
             mirror_timers: Default::default(),
@@ -1326,6 +1325,7 @@ impl Model {
             video_caps: super::cvars::VideoCaps::default(),
             restart_gx_asks: 0,
             saved_names: Vec::new(),
+            saved_names_per_character: Vec::new(),
             held_saved_files: Vec::new(),
             keybinds: super::keybind::KeybindState::default(),
             actions: HashMap::new(),

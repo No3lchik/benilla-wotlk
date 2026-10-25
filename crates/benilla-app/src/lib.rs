@@ -27,6 +27,7 @@ static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod account_data;
 pub mod addon_harness;
 mod area;
 mod area_poi;
@@ -100,8 +101,6 @@ mod script_calls;
 mod shaders;
 
 mod game_tip;
-mod item_persist;
-mod name_persist;
 mod opaque2d;
 /// Where "the client is going down" is observed, in `Last`; every system that persists state on the
 /// way out registers through it.
@@ -202,6 +201,7 @@ mod ui_world_map;
 mod unit_auras;
 mod video;
 mod vplates;
+mod wdb;
 mod weapon_trail;
 mod world_backdrop;
 mod world_state;
@@ -234,13 +234,19 @@ pub fn run_with(build: BuildId, extend: impl FnOnce(&mut App)) -> AppExit {
     launch(build, Some(Box::new(extend)))
 }
 
-/// The state folder, `benilla-config/`, where a crate on top keeps its own files: an addon it ships
-/// goes in its `AddOns/`, where benilla finds addons and their art and fonts. `None` when
+/// The state folder, `benilla-config/`, where a crate on top keeps its own files. `None` when
 /// persistence is off (a capture run, or no executable path), and it may not exist yet. A dev
 /// build resolves it from the launcher's folder, which [`run_with`] sets, so ask from `extend` or
 /// a system, never before.
 pub fn config_dir() -> Option<std::path::PathBuf> {
     local_state::home()
+}
+
+/// The addon folder, `Interface\AddOns\` under `benilla-config/` (or the install, for the drop-in
+/// `Wow.exe`), where benilla finds addons and their art and fonts: an addon a crate on top ships
+/// is written here. `None` and timing as [`config_dir`].
+pub fn addons_dir() -> Option<std::path::PathBuf> {
+    local_state::addons_dir()
 }
 
 /// What a crate on top of benilla adds to the built app ([`run_with`]).
@@ -272,6 +278,23 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     // A dev build's install, state folder and probe identity resolve from the launcher's folder,
     // so a crate on top of benilla keeps them in its own and not in cargo's checkout of benilla.
     benilla_formats::set_project_folder(build.project_dir);
+
+    // A drop-in `Wow.exe` is its install's own client: it reads `<exe dir>/Data` and nothing else,
+    // and refuses to start without one rather than run on some other install.
+    if build.standalone {
+        let root = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(std::path::Path::to_path_buf));
+        let Some(root) = root.filter(|r| r.join("Data").is_dir()) else {
+            eprintln!(
+                "benilla: this is the standalone build, which replaces Wow.exe: put it in the WoW \
+                 folder, beside Data/ (no Data/ next to {:?})",
+                std::env::current_exe().ok()
+            );
+            return AppExit::error();
+        };
+        benilla_formats::set_drop_in_install(&root);
+    }
 
     // From here a panic leaves `benilla-config/Diagnostics/crash-<unix>.txt`; armed before the
     // `App` exists, so a panic while plugins build is reported too.
@@ -364,7 +387,7 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
 
     app.add_plugins(benilla_world::boot::tuned_default_plugins(Window {
         title: "benilla".into(),
-        // Born in the player's display mode (`gxWindow` read straight off `config.toml`) rather
+        // Born in the player's display mode (`gxWindow` read straight off `Config.wtf`) rather
         // than flipped into it at `Startup`, which would flash on every launch and, under
         // gamescope, spend the first second in the input state fullscreen is meant to end.
         // Instrumented runs stay windowed (`video::windowed_env`).

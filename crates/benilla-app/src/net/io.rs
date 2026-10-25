@@ -761,6 +761,10 @@ fn world(
             return Ok(WorldEnd::Cycle(Cycle::Exit));
         }
 
+        if !forward_glue(&mut session, events_tx) {
+            return Ok(WorldEnd::Cycle(Cycle::Exit));
+        }
+
         // The link: the character park, the world, and back to the park on the same link after a
         // logout or a refused character login (`0x5aaeb0`, `0x5aad70`: `0x401ee0` tears the world
         // down and closes nothing). Its first world entry starts the connection's ping block.
@@ -817,6 +821,23 @@ fn world(
                         // `GetCharacterListUpdate` (`0x4723d0` → `0x46b880` → `0x5aabb0` → `0x5b4690`):
                         // the reference asks the world server again whenever the glue screen wants
                         // the list. A Warden refusal is the server's answer, as at the park entry.
+                        // The account's account-data times, and a slot's request or upload: the
+                        // answers are kept by the next read and handed on below.
+                        Ok(ParkRequest::Char(CharRequest::AccountDataReady)) => {
+                            session.ready_for_account_data_times()?;
+                            Parked::StayPut
+                        }
+                        Ok(ParkRequest::Char(CharRequest::AccountData(wire))) => {
+                            match wire {
+                                crate::account_data::Wire::Request { slot } => {
+                                    session.request_account_data(slot)?
+                                }
+                                crate::account_data::Wire::Upload { slot, time, bytes } => {
+                                    session.update_account_data(slot, time, &bytes)?
+                                }
+                            }
+                            Parked::StayPut
+                        }
                         Ok(ParkRequest::Char(CharRequest::Enumerate)) => match session.char_enum() {
                             Ok(c) => {
                                 characters = c;
@@ -835,6 +856,9 @@ fn world(
                     },
                     recv(login_rx) -> msg => msg.map_or(Parked::Exit, Parked::Login),
                 };
+                if !forward_glue(&mut session, events_tx) {
+                    return Ok(WorldEnd::Cycle(Cycle::Exit));
+                }
                 let (action, code) = match answer {
                     Parked::Exit => return Ok(WorldEnd::Cycle(Cycle::Exit)),
                     Parked::Repark => return Ok(WorldEnd::Cycle(Cycle::Repark)),
@@ -934,6 +958,9 @@ fn world(
                     "net: no SMSG_ADDON_INFO — GetNumAddOns() stays 0, as the reference's would"
                 ),
             }
+            if !forward_glue(&mut session, events_tx) {
+                return Ok(WorldEnd::Cycle(Cycle::Exit));
+            }
             let (mut reader, writer) = session.into_split()?;
             // Installed before the entry is announced, so the app's first command finds it.
             let install = WriterSwap::Install {
@@ -1006,6 +1033,15 @@ fn world(
             }
         }
     } // 'realm
+}
+
+/// The packets a glue-time read kept ([`benilla_protocol::world::WorldSession::take_glue_events`]),
+/// on to the app in arrival order; `false` once the app is gone.
+fn forward_glue(session: &mut WorldSession, events_tx: &Sender<SessionEvent>) -> bool {
+    session
+        .take_glue_events()
+        .into_iter()
+        .all(|ev| events_tx.send(ev).is_ok())
 }
 
 /// How the world stream ended, short of a socket failure.
@@ -1384,6 +1420,14 @@ pub(super) fn writer_loop(
                     ClientCommand::ChannelAnnouncements { name } => w.channel_announcements(&name),
                     ClientCommand::ChannelModerate { name } => w.channel_moderate(&name),
                     ClientCommand::PlayedTime => w.played_time(),
+                    ClientCommand::AccountData(crate::account_data::Wire::Request { slot }) => {
+                        w.request_account_data(slot)
+                    }
+                    ClientCommand::AccountData(crate::account_data::Wire::Upload {
+                        slot,
+                        time,
+                        bytes,
+                    }) => w.update_account_data(slot, time, &bytes),
                     ClientCommand::NameQuery { guid } => w.name_query(guid),
                     ClientCommand::CreatureQuery { entry, guid } => w.creature_query(entry, guid),
                     ClientCommand::PetNameQuery { pet_number, guid } => {
