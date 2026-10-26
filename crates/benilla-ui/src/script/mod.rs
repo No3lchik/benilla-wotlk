@@ -97,6 +97,7 @@ mod calendar;
 mod calls;
 mod camera_view;
 mod channel;
+mod channel_pane;
 mod char_sheet;
 mod char_stats;
 mod chat_misc;
@@ -289,6 +290,7 @@ pub use bind_confirm::PendingEquipAnswer;
 pub use calls::{CastAt, NearestMode, ScriptCall};
 pub use camera_view::{CameraViewRequest, CAMERA_VIEW_COUNT};
 pub use channel::{ChannelCommand, ZoneChannelRow};
+pub use channel_pane::ChannelSlotInfo;
 pub use char_stats::{
     weapon_subclass_skill, BankBagSlots, InvSlotView, InventorySlots, UnitCombatStats,
     BANK_BAG_SLOT_COUNT, INVENTORY_SLOT_COUNT, SKILL_DEFENSE, SKILL_UNARMED,
@@ -967,6 +969,7 @@ fn install_in_game(lua: &Lua) -> mlua::Result<()> {
     chat_types::install(lua)?;
     chat_misc::install(lua)?;
     channel::install(lua)?;
+    channel_pane::install(lua)?;
     chat_window::install(lua)?;
     client::install(lua)?;
     screenshot::install(lua)?;
@@ -1761,7 +1764,8 @@ impl UiScript {
     /// dialog (`BasicControls.xml:16`). With none installed the error stays on the host channel,
     /// [`UiScript::errors`], alone; a handler that raises is recorded there only and stops the
     /// batch, so the path cannot recurse. The call is [`stdlib::protected_call`]'s, so a raising
-    /// handler costs no `_G` search.
+    /// handler costs no `_G` search. `debuglocals` answers only inside it, as `s_inErrorHandler`
+    /// (`0x819730`) gates it.
     pub fn dispatch_script_errors_to_handler(&mut self) {
         if self.model_ref().pending_error_dispatch.is_empty() {
             return;
@@ -1781,7 +1785,14 @@ impl UiScript {
                     break;
                 }
             };
-            if let Err(e) = stdlib::protected_call(&self.lua, &handler, arg) {
+            let in_handler = |on: bool| {
+                self.lua
+                    .set_named_registry_value(stdlib::REG_IN_ERROR_HANDLER, on)
+            };
+            let called =
+                in_handler(true).and_then(|()| stdlib::protected_call(&self.lua, &handler, arg));
+            let _ = in_handler(false);
+            if let Err(e) = called {
                 self.model_mut()
                     .errors
                     .push(format!("error handler itself failed: {e}"));
