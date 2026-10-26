@@ -154,6 +154,9 @@ pub(crate) struct Placements {
     /// Placements awaiting their model plus WMO props awaiting their M2s; at zero the spawner skips
     /// its [`Self::by_id`] walk. Every register, handoff, release and spawn site keeps it.
     pending_spawns: usize,
+    /// Bumped wherever a placement spawns, is handed off or is released: the resident-WMO set's
+    /// one input ([`sync_interior_volumes`]). The resource's own change mark moves every frame.
+    spawn_epoch: u64,
 }
 
 impl Placements {
@@ -1140,9 +1143,17 @@ fn rescatter_clutter(
     }
 }
 
-/// Mirror the spawned WMO placements into [`WmoResidency`] each frame, so the interior classifier
-/// re-tests when a building streams in or out; rebuilt whole, as few WMOs are resident.
-fn sync_interior_volumes(placements: Res<Placements>, mut vols: ResMut<WmoResidency>) {
+/// Mirror the spawned WMO placements into [`WmoResidency`], so the interior classifier re-tests
+/// when a building streams in or out; rebuilt whole only when a placement spawned or left (a city
+/// holds thousands of placements, so a still frame skips the walk).
+fn sync_interior_volumes(
+    placements: Res<Placements>,
+    mut vols: ResMut<WmoResidency>,
+    mut seen: Local<Option<u64>>,
+) {
+    if seen.replace(placements.spawn_epoch) == Some(placements.spawn_epoch) {
+        return;
+    }
     vols.update(
         placements
             .by_id
@@ -1231,6 +1242,7 @@ fn handoff_straddlers(
             }
             p.spawned = false;
             placements.pending_spawns += 1;
+            placements.spawn_epoch += 1;
         }
         handed += 1;
     }
@@ -1258,6 +1270,7 @@ fn release_placement(
     };
     if drop_it {
         if let Some(p) = placements.by_id.remove(&uid) {
+            placements.spawn_epoch += 1;
             // Its unspawned model and props leave the pending count with it.
             placements.pending_spawns -=
                 usize::from(!p.spawned) + p.doodads.iter().filter(|d| !d.spawned).count();
@@ -1330,6 +1343,39 @@ mod focus_tests {
         assert_eq!(
             ViewFocus::camera().resolve(None),
             [SPAWN_XY.0, SPAWN_XY.1, 0.0]
+        );
+    }
+}
+
+#[cfg(test)]
+mod residency_tests {
+    use super::*;
+
+    /// A frame with no placement spawned or released leaves the residency unwritten, even when
+    /// another system wrote `Placements` (the art scope touches its material cache every frame).
+    #[test]
+    fn untouched_placements_skip_the_residency_rebuild() {
+        let mut world = World::new();
+        world.init_resource::<Placements>();
+        world.init_resource::<WmoResidency>();
+        let mut sys = IntoSystem::into_system(sync_interior_volumes);
+        sys.initialize(&mut world);
+        sys.run((), &mut world).unwrap();
+        let settled = world.resource_ref::<WmoResidency>().last_changed();
+        world.clear_trackers();
+        world.resource_mut::<Placements>().materials.clear();
+        sys.run((), &mut world).unwrap();
+        assert_eq!(
+            world.resource_ref::<WmoResidency>().last_changed(),
+            settled,
+            "a frame with no spawn rewrote the residency"
+        );
+        world.resource_mut::<Placements>().spawn_epoch += 1;
+        sys.run((), &mut world).unwrap();
+        assert_ne!(
+            world.resource_ref::<WmoResidency>().last_changed(),
+            settled,
+            "a spawn rebuilds it"
         );
     }
 }

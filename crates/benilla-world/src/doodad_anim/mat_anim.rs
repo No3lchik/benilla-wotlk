@@ -132,35 +132,34 @@ pub fn sample_mat_anim(
     time: Res<Time>,
     hosts: Query<(&AnimationPlayer, &ModelAnimations)>,
     mut q: Query<&mut MatAnim>,
-    // One host's playing slot this frame, shared by its many animated batches.
-    mut played_by_host: Local<bevy::ecs::entity::EntityHashMap<Option<(usize, f32)>>>,
 ) {
-    played_by_host.clear();
     let now = time.elapsed_secs();
     // The scene clock in f64: a long-uptime f32 drifts whole milliseconds.
     let shared = time.elapsed_secs_f64();
-    for mut m in &mut q {
+    // Each instance reads its host and writes only itself; a sample that lands where it stood
+    // leaves the row unmarked, since the Visibility authority re-walks every marked batch.
+    q.par_iter_mut().for_each(|mut m| {
         if m.frozen {
-            continue;
+            return;
         }
         // A host with no player yet keeps its last slot at t = 0, a bind-posed model's pose.
-        let played = m.host.and_then(|h| {
-            *played_by_host
-                .entry(h)
-                .or_insert_with(|| hosts.get(h).ok().and_then(|(p, a)| playing_seq(p, a)))
-        });
+        let played = m
+            .host
+            .and_then(|h| hosts.get(h).ok().and_then(|(p, a)| playing_seq(p, a)));
         let (seq, elapsed) = match played {
-            Some((seq, t)) => {
-                m.seq = Some(seq);
-                (Some(seq), t)
-            }
+            Some((seq, t)) => (Some(seq), t),
             None if m.host.is_some() => (m.seq, 0.0),
             None => (m.seq, now - m.spawned_at),
         };
         // The gseq cursor is sceneNow − attach, the anchor stamped on the first pass.
-        let attach = *m.gseq_attach.get_or_insert(shared);
-        m.current = m.anim.sample(seq, elapsed, shared - attach);
-    }
+        let attach = m.gseq_attach.unwrap_or(shared);
+        let current = m.anim.sample(seq, elapsed, shared - attach);
+        if m.seq != seq || m.gseq_attach.is_none() || m.current.to_bits() != current.to_bits() {
+            m.seq = seq;
+            m.gseq_attach = Some(attach);
+            m.current = current;
+        }
+    });
 }
 
 /// The scan marker: a part whose material can be a [`UvAnimMaterials`] or [`TintAnimMaterials`]
@@ -695,7 +694,14 @@ pub(super) fn tick_anim_materials(
     mut drawn: Local<
         bevy::platform::collections::HashSet<AssetId<benilla_assets::materials::WowModelMaterial>>,
     >,
+    // A registered material can only die on a frame its store reports one unused or removed.
+    mut lifecycle: MessageReader<AssetEvent<benilla_assets::materials::WowModelMaterial>>,
 ) {
+    // Read before any early return, so no frame's deaths are missed.
+    let mut gc = false;
+    for e in lifecycle.read() {
+        gc |= matches!(e, AssetEvent::Unused { .. } | AssetEvent::Removed { .. });
+    }
     if uv_reg.0.is_empty() && tint_reg.0.is_empty() {
         // Marked parts beside an empty registry mean this lane is dead, not that nothing animates.
         if parts.iter().next().is_some() {
@@ -730,7 +736,7 @@ pub(super) fn tick_anim_materials(
     uv_reg.0.retain(|id, entry| {
         // Alive means either half holds it: a material parked by `model_render::lazy` is not in
         // the store, and registration happens once, at spawn.
-        if !crate::model_render::lazy::holds(&materials, *id) {
+        if gc && !crate::model_render::lazy::holds(&materials, *id) {
             for e in std::iter::once(&*entry).chain(entry.stage1.as_deref()) {
                 table.free(e.slot);
                 if let Some(a) = &e.affine {
@@ -754,7 +760,7 @@ pub(super) fn tick_anim_materials(
         true
     });
     tint_reg.0.retain(|id, entry| {
-        if !crate::model_render::lazy::holds(&materials, *id) {
+        if gc && !crate::model_render::lazy::holds(&materials, *id) {
             table.free(entry.slot);
             return false;
         }
@@ -1041,6 +1047,59 @@ mod delta_tests {
             affine: None,
             stage1: None,
         }
+    }
+
+    /// A registered material stands while any holder keeps it, and leaves the registry, freeing
+    /// its slot, once its last handle drops and the store reports it unused; the registry asks the
+    /// store only on such frames.
+    #[test]
+    fn a_dropped_material_leaves_the_registry() {
+        use benilla_assets::materials::WowModelMaterial;
+        use bevy::asset::AssetPlugin;
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<WowModelMaterial>()
+            .init_resource::<UvAnimMaterials>()
+            .init_resource::<TintAnimMaterials>()
+            .init_resource::<crate::mat_anim_table::MatAnimTable>()
+            .init_resource::<crate::model_render::FarSideTwins>()
+            .add_systems(Update, tick_anim_materials);
+        let handle = app
+            .world()
+            .resource::<Assets<WowModelMaterial>>()
+            .reserve_handle();
+        let id = handle.id();
+        let slot = app
+            .world_mut()
+            .resource_mut::<crate::mat_anim_table::MatAnimTable>()
+            .alloc()
+            .expect("a fresh table has room");
+        let mut entry = fx_entry(0.0);
+        entry.slot = slot;
+        app.world_mut()
+            .resource_mut::<UvAnimMaterials>()
+            .0
+            .insert(id, entry);
+        app.update();
+        app.update();
+        assert!(
+            app.world()
+                .resource::<UvAnimMaterials>()
+                .0
+                .contains_key(&id),
+            "a held material keeps its entry"
+        );
+        drop(handle);
+        for _ in 0..3 {
+            app.update();
+        }
+        assert!(
+            !app.world()
+                .resource::<UvAnimMaterials>()
+                .0
+                .contains_key(&id),
+            "the dropped material's entry is reaped"
+        );
     }
 
     /// A rotation-only loop: a quarter turn about Z over two seconds, in file slot 0 only.

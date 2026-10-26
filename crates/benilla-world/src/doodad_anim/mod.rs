@@ -295,14 +295,19 @@ fn reroll_doodad_variation(
 #[allow(clippy::type_complexity)] // one Bevy system's full input set
 fn gate_doodad_anim(
     time: Res<Time>,
-    mut hosts: Query<(
-        Entity,
-        &mut DoodadAnimHost,
-        Option<&lazy::LazyRig>,
-        Option<&RigPose>,
-        Has<crate::rig_palette::RigSkin>,
-        Option<&mut AnimationPlayer>,
-        Option<&mut GlobalSeqDrive>,
+    // The walk, and a still frame's one reason to walk anyway: a host born since.
+    mut host_set: ParamSet<(
+        Query<(
+            Entity,
+            &mut DoodadAnimHost,
+            Option<&lazy::LazyRig>,
+            Option<&RigPose>,
+            Has<crate::rig_palette::RigSkin>,
+            Option<&mut AnimationPlayer>,
+            Option<&mut GlobalSeqDrive>,
+            Has<AnimParked>,
+        )>,
+        Query<(), Added<DoodadAnimHost>>,
     )>,
     vis: Query<&Visibility>,
     cam: Query<
@@ -328,9 +333,11 @@ fn gate_doodad_anim(
     mut twin_parts: lazy::TwinParts,
     mut commands: Commands,
     mut logged: Local<bool>,
+    // A still frame re-judges nothing; only a new host or a retried rig promote needs the walk.
+    mut promote_pending: Local<bool>,
 ) {
     // One log line per session, the first frame any host exists.
-    if !*logged && !hosts.is_empty() {
+    if !*logged && !host_set.p0().is_empty() {
         *logged = true;
         info!("doodad anim: first host armed");
     }
@@ -342,6 +349,10 @@ fn gate_doodad_anim(
         !tf.is_changed() && !proj.is_changed() && !local.as_ref().is_some_and(|l| l.is_changed())
     }) && !scene.changed()
         && changed_vis.is_empty();
+    if verdicts_still && host_set.p1().is_empty() && !*promote_pending {
+        return;
+    }
+    let mut pending = false;
     // Fixed at spawn (`EmitterFade`), so a reused verdict never sees the sphere move.
     let in_frustum = |frustum: &bevy::camera::primitives::Frustum,
                       fade: &crate::particles::EmitterFade| {
@@ -353,7 +364,8 @@ fn gate_doodad_anim(
             false,
         )
     };
-    for (entity, mut host, lazy, pose, has_rig, player, drive) in &mut hosts {
+    let mut hosts = host_set.p0();
+    for (entity, mut host, lazy, pose, has_rig, player, drive, parked) in &mut hosts {
         // A host born this frame has no verdict to reuse (`active` starts false).
         let drawn = if verdicts_still && !host.is_added() {
             host.active
@@ -388,7 +400,8 @@ fn gate_doodad_anim(
         // judged, so every far doodad of a new tile reads drawn.
         if drawn && host.active && !has_rig {
             if let Some(lazy) = lazy {
-                lazy::promote_lazy_rig(
+                // A full table re-walks next frame to retry; a landed promote rigs the host.
+                pending |= !lazy::promote_lazy_rig(
                     &mut commands,
                     &mut palettes,
                     &ibps,
@@ -400,7 +413,9 @@ fn gate_doodad_anim(
                 );
             }
         }
-        if drawn == host.active {
+        // An undrawn host that never was drawn still parks: born out of view, its global
+        // sequences would otherwise tick and re-pose it every frame (~2,300 at Dalaran).
+        if drawn == host.active && (drawn || parked) {
             continue;
         }
         host.active = drawn;
@@ -432,6 +447,7 @@ fn gate_doodad_anim(
             d.set_paused(!drawn);
         }
     }
+    *promote_pending = pending;
 }
 
 pub struct DoodadAnimPlugin;
@@ -586,6 +602,38 @@ mod tests {
             app.world().entity(part).get::<MatAnim>().unwrap().current,
             1.0,
             "playing sequence 1 ⇒ the batch draws"
+        );
+    }
+
+    /// A constant sample leaves the instance unmarked: the Visibility authority re-walks every
+    /// marked batch, and a city holds thousands of animated materials.
+    #[test]
+    fn a_constant_mat_anim_is_written_once() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_systems(Update, sample_mat_anim);
+        let part = app
+            .world_mut()
+            .spawn(MatAnim::new(two_seq_alpha(), 0.0, false))
+            .id();
+        app.update();
+        let stamped = app
+            .world()
+            .entity(part)
+            .get_ref::<MatAnim>()
+            .unwrap()
+            .last_changed();
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(
+            app.world()
+                .entity(part)
+                .get_ref::<MatAnim>()
+                .unwrap()
+                .last_changed(),
+            stamped,
+            "a constant sample re-marked the instance"
         );
     }
 
@@ -1152,7 +1200,7 @@ mod tests {
             frustum,
             projection,
         ));
-        let mut meshed = |center: Vec3| {
+        let mut meshed = |center: Vec3, active: bool| {
             let mesh = app.world_mut().spawn(Visibility::Inherited).id();
             app.world_mut()
                 .spawn(DoodadAnimHost {
@@ -1162,18 +1210,24 @@ mod tests {
                     armed_at: 0.0,
                     window_hi: f32::INFINITY,
                     anim_id: Some(0),
-                    active: true,
+                    active,
                     parked_at: 0.0,
                 })
                 .id()
         };
-        let behind = meshed(Vec3::new(0.0, 0.0, 30.0));
-        let ahead = meshed(Vec3::new(0.0, 0.0, -30.0));
+        let behind = meshed(Vec3::new(0.0, 0.0, 30.0), true);
+        let ahead = meshed(Vec3::new(0.0, 0.0, -30.0), true);
+        // Never drawn: its first verdict is already "not drawn", and it must park all the same.
+        let born_behind = meshed(Vec3::new(0.0, 0.0, 30.0), false);
         app.update();
         let world = app.world();
         assert!(
             world.entity(behind).contains::<AnimParked>(),
             "behind the camera ⇒ outside the frustum ⇒ parked, whatever its part's Visibility"
+        );
+        assert!(
+            world.entity(born_behind).contains::<AnimParked>(),
+            "a host born out of view parks without ever having been drawn"
         );
         assert!(
             !world.entity(ahead).contains::<AnimParked>(),
