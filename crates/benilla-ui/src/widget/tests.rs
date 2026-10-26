@@ -54,6 +54,52 @@ fn the_glance_table_follows_visibility_destroy_and_slot_reuse() {
     }
 }
 
+/// Every node's visibility and walk key, as its glance mirrors them.
+fn assert_glances_agree(a: &WidgetArena) {
+    for (h, f) in a.iter_frames() {
+        let g = a.glance(h).expect("a live frame has a glance");
+        assert_eq!(
+            (g.visible, g.walk_key()),
+            (f.effective_visible, (f.strata, f.level, f.insertion_seq)),
+            "glance of {h:?}"
+        );
+    }
+}
+
+#[test]
+fn the_glance_mirrors_the_walk_key_through_every_mutator() {
+    let mut a = arena();
+    let root = a.create(FrameKind::Frame, None, None);
+    let child = a.create(FrameKind::Frame, None, Some(root));
+    let grand = a.create(FrameKind::Frame, None, Some(child));
+    let other = a.create(FrameKind::Frame, None, None);
+    assert_glances_agree(&a);
+    a.set_frame_level(root, 5, true);
+    assert_glances_agree(&a);
+    a.set_frame_strata(child, Strata::Dialog);
+    assert_glances_agree(&a);
+    a.set_shown(root, false);
+    a.set_shown(root, true);
+    assert_glances_agree(&a);
+    a.set_parent(grand, Some(other));
+    assert_glances_agree(&a);
+    a.compress_strata(Strata::Medium);
+    assert_glances_agree(&a);
+    let epoch = a.link_epoch();
+    a.set_shown(other, false);
+    assert!(a.link_epoch() > epoch, "an unlink moves the link epoch");
+    let epoch = a.link_epoch();
+    a.set_frame_level(other, 9, false);
+    assert_eq!(
+        a.link_epoch(),
+        epoch,
+        "a hidden frame's level change links nothing"
+    );
+    a.set_shown(other, true);
+    assert!(a.link_epoch() > epoch, "a show links");
+    assert_glances_agree(&a);
+}
+
 #[test]
 fn mid_tree_hide_blocks_a_shown_grandchild() {
     let mut a = arena();
@@ -63,7 +109,11 @@ fn mid_tree_hide_blocks_a_shown_grandchild() {
     assert!(a.frame(grand).unwrap().effective_visible);
 
     let changed = a.set_shown(child, false);
-    assert_eq!(changed, vec![child, grand]); // pre-order
+    assert_eq!(
+        changed,
+        vec![grand, child],
+        "each frame after its descendants"
+    );
     assert!(a.frame(root).unwrap().effective_visible);
     assert!(!a.frame(child).unwrap().effective_visible);
     assert!(!a.frame(grand).unwrap().effective_visible);
@@ -73,7 +123,7 @@ fn mid_tree_hide_blocks_a_shown_grandchild() {
     );
 
     let changed = a.set_shown(child, true);
-    assert_eq!(changed, vec![child, grand]);
+    assert_eq!(changed, vec![grand, child]);
     assert!(a.frame(grand).unwrap().effective_visible);
 }
 
@@ -87,10 +137,10 @@ fn hidden_grandchild_stays_hidden_when_ancestor_reshows() {
     a.set_shown(grand, false);
     let changed = a.set_shown(root, false);
     // grand is already invisible, so the hide does not report it.
-    assert_eq!(changed, vec![root, child]);
+    assert_eq!(changed, vec![child, root]);
 
     let changed = a.set_shown(root, true);
-    assert_eq!(changed, vec![root, child]);
+    assert_eq!(changed, vec![child, root]);
     assert!(a.frame(child).unwrap().effective_visible);
     assert!(!a.frame(grand).unwrap().effective_visible);
 }
@@ -147,6 +197,96 @@ fn level_shift_saturates_at_zero() {
     // Root drops by 10, which would take the child to -7: it stops at 0.
     a.set_frame_level(root, 0, true);
     assert_eq!(a.frame(child).unwrap().level, 0);
+}
+
+// ── Level compression ────────────────────────────────────────────────────────────────────────
+
+/// Top-level frames at `levels`, created in order, each shown so it links and lifts the bound.
+fn at_levels(a: &mut WidgetArena, levels: &[u16]) -> Vec<FrameHandle> {
+    levels
+        .iter()
+        .map(|&level| {
+            let h = a.create(FrameKind::Frame, None, None);
+            a.set_frame_level(h, level, false);
+            h
+        })
+        .collect()
+}
+
+fn levels_of(a: &WidgetArena, frames: &[FrameHandle]) -> Vec<u16> {
+    frames.iter().map(|&h| a.frame(h).unwrap().level).collect()
+}
+
+/// `0x495060` resumes at the used level after a drop, so the second run of empties inside the
+/// dropped span survives: `{0, 4, 6}` under a bound of 7 becomes `{0, 1, 3}` under 4.
+#[test]
+fn compression_leaves_the_references_hole_past_a_wide_gap() {
+    let mut a = arena();
+    let frames = at_levels(&mut a, &[0, 4, 6]);
+    assert_eq!(a.top_level(Strata::Medium), 7);
+    assert_eq!(a.compress_strata(Strata::Medium), 4);
+    assert_eq!(levels_of(&a, &frames), vec![0, 1, 3]);
+    assert_eq!(a.top_level(Strata::Medium), 4, "the bound is written back");
+}
+
+/// A frame at or past the bound is outside the scan: hidden at level 10 under a bound of 2, it
+/// keeps its level rather than being pulled down under the frames a raise lands above.
+#[test]
+fn compression_leaves_a_hidden_frame_past_the_bound_where_it_is() {
+    let mut a = arena();
+    let frames = at_levels(&mut a, &[0, 1]);
+    let high = a.create(FrameKind::Frame, None, None);
+    a.set_shown(high, false);
+    a.set_frame_level(high, 10, false);
+    assert_eq!(
+        a.top_level(Strata::Medium),
+        2,
+        "a hidden frame links nowhere"
+    );
+    assert_eq!(a.compress_strata(Strata::Medium), 2);
+    assert_eq!(levels_of(&a, &frames), vec![0, 1]);
+    assert_eq!(a.frame(high).unwrap().level, 10);
+    // Showing it links it at 10, which lifts the bound past it (`0x495de0`).
+    a.set_shown(high, true);
+    assert_eq!(a.top_level(Strata::Medium), 11);
+    assert_eq!(a.compress_strata(Strata::Medium), 3);
+    assert_eq!(a.frame(high).unwrap().level, 2);
+}
+
+/// A hidden frame below the bound holds its level open, as the scan reads the frame registry.
+#[test]
+fn a_hidden_frame_below_the_bound_keeps_its_level_in_use() {
+    let mut a = arena();
+    let frames = at_levels(&mut a, &[0, 2, 3]);
+    a.set_shown(frames[1], false);
+    assert_eq!(a.compress_strata(Strata::Medium), 3);
+    assert_eq!(levels_of(&a, &frames), vec![0, 1, 2]);
+}
+
+/// The moves go through the level setter, which relinks a visible frame at its bucket's tail, one
+/// level at a time and in creation order: a frame relinked late at level 4 ends up behind an
+/// older one moved after it.
+#[test]
+fn compression_relinks_moved_frames_in_creation_order() {
+    let mut a = arena();
+    let frames = at_levels(&mut a, &[0, 4, 4, 5]);
+    let (older, newer, above) = (frames[1], frames[2], frames[3]);
+    // Relink `older` after `newer`: its stamp is now the later one.
+    a.set_shown(older, false);
+    a.set_shown(older, true);
+    let seq = |a: &WidgetArena, h| a.frame(h).unwrap().insertion_seq;
+    assert!(seq(&a, older) > seq(&a, newer));
+
+    assert_eq!(a.compress_strata(Strata::Medium), 3);
+    assert_eq!(levels_of(&a, &frames), vec![0, 1, 1, 2]);
+    assert!(
+        seq(&a, older) < seq(&a, newer),
+        "creation order relinks the older frame first"
+    );
+    assert!(
+        seq(&a, newer) < seq(&a, above),
+        "level 4 moves before level 5"
+    );
 }
 
 // ── Scale ────────────────────────────────────────────────────────────────────────────────────
