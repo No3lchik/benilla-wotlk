@@ -41,6 +41,15 @@ impl PlacementHost {
     }
 }
 
+/// What [`spawn_model_entities`] spawns: everything; only the diverts of a dormant placement, its
+/// entity batches noted for its wake; or only the noted entity batches, the wake itself.
+#[derive(Clone, Copy)]
+pub enum SpawnMode<'a> {
+    Full,
+    DivertOnly,
+    Entities(&'a [bool]),
+}
+
 /// What [`spawn_model_entities`] spawned.
 pub struct SpawnedModel {
     /// The despawn list: anim host, parts and world-root cards (a following card despawns itself).
@@ -50,6 +59,9 @@ pub struct SpawnedModel {
     pub by_batch: Vec<Option<Entity>>,
     /// The anim host, when the model animates.
     pub host: Option<PlacementHost>,
+    /// Index-parallel with `submeshes`: the batches the entity phase spawns (cards included),
+    /// whether or not this call spawned them.
+    pub entity_batches: Vec<bool>,
 }
 
 /// Spawns a model's submeshes at `transform`. A transport's props pass a doodad-local `transform`
@@ -100,6 +112,7 @@ pub fn spawn_model_entities(
         &mut crate::static_gx::StaticGx,
         crate::static_gx::GxSite<'_>,
     )>,
+    mode: SpawnMode<'_>,
 ) -> SpawnedModel {
     // The caller's gate, else the bare sphere; every radius or centre read below goes through it.
     let fade = match fade {
@@ -124,6 +137,7 @@ pub fn spawn_model_entities(
                 || !m.emitters.is_empty()
                 || !m.ribbons.is_empty()
         })
+        .filter(|_| !matches!(mode, SpawnMode::DivertOnly))
         .and_then(|(m, _)| crate::doodad_anim::spawn_anim_host(commands, m, transform));
     // Captures freeze material-alpha clocks at 0, for deterministic frames.
     let mat_frozen = crate::dev_state::deterministic_run();
@@ -137,6 +151,9 @@ pub fn spawn_model_entities(
     let mut lazy_parts: Vec<Entity> = Vec::new();
     // Every `continue` below leaves its batch's `None` in place.
     let mut by_batch: Vec<Option<Entity>> = vec![None; submeshes.len()];
+    let mut entity_batches = vec![false; submeshes.len()];
+    // The fixed, fading cards that wait in the store rather than spawn (`crate::card_store`).
+    let mut stored: Vec<crate::card_store::StoredCard> = Vec::new();
     // Coplanar siblings ride one lane: two batches naming one skin section draw the same
     // triangles, which the reference draws from one vertex array under LEQUAL, so the later wins
     // exactly (`0x70c190`). Split across lanes, the two reach each vertex by different float
@@ -152,6 +169,12 @@ pub fn spawn_model_entities(
         let Some((stat_mesh, stat_aabb)) = forms.stat.get(batch_idx) else {
             continue;
         };
+        // A wake spawns only what the first spawn left to the entity phase.
+        if let SpawnMode::Entities(mask) = mode {
+            if !mask.get(batch_idx).copied().unwrap_or(false) {
+                continue;
+            }
+        }
         // The authored order biases the transparent sort, so coplanar layers draw in file order;
         // a WMO batch also takes it into the clip-z nudge, as the reference draws MOBA batches in
         // strict file order (`0x6b4f10`/`0x6b5190`).
@@ -355,8 +378,22 @@ pub fn spawn_model_entities(
                         instance,
                         groups,
                         slot,
+                        key,
                     } if !is_wmo && class.merges() => {
-                        if steady_interior_prop || class.never_fade {
+                        // An exterior fader prop enters with its seed, as a doodad does, and
+                        // returns as an entity inside its fade band.
+                        let fade_seed = (!steady_interior_prop
+                            && !class.never_fade
+                            && !crate::static_gx::fade_lane_disabled())
+                        .then(|| crate::static_gx::GxFadeSeed {
+                            size: fade.size,
+                            local_center,
+                            stat_mesh: stat_mesh.clone(),
+                            aabb: *stat_aabb,
+                            cutout: cutout.clone(),
+                            blend: blend.clone(),
+                        });
+                        if steady_interior_prop || class.never_fade || fade_seed.is_some() {
                             Some((
                                 (0, 0), // prop items release by instance death too
                                 None,
@@ -364,11 +401,12 @@ pub fn spawn_model_entities(
                                     instance: *instance,
                                     groups: std::sync::Arc::clone(groups),
                                     slot: *slot,
+                                    key: *key,
                                 }),
-                                None,
+                                fade_seed,
                             ))
                         } else {
-                            gx.tally_prop_declined(false); // an exterior fader prop
+                            gx.tally_prop_declined(false); // an exterior fader, fade lane off
                             None
                         }
                     }
@@ -425,6 +463,11 @@ pub fn spawn_model_entities(
             {
                 continue;
             }
+        }
+        // Past the diverts: the entity phase's batch, which a dormant placement only notes.
+        entity_batches[batch_idx] = true;
+        if matches!(mode, SpawnMode::DivertOnly) {
+            continue;
         }
         // Register both materials for the UV scroll (idempotent per material). A per-sequence set
         // replaces the shared loop when there is a host to read; a period-0 loop is a constant the
@@ -550,6 +593,46 @@ pub fn spawn_model_entities(
                     None => BillboardCard::new(info, transform),
                 },
             };
+            // A fixed card that fades out with distance, on the plain material lane, waits as a
+            // record; the store spawns this same bundle while the camera is in its range.
+            let storable = crate::card_store::enabled()
+                && card.follows().is_none()
+                && !entity_hosted
+                && sub.alpha_anim.is_none()
+                && crate::model_fade::fade_band(fade.size).is_some();
+            if storable {
+                stored.push(crate::card_store::StoredCard {
+                    mesh: stat_mesh.clone(),
+                    material: cutout.clone(),
+                    part: ModelPart {
+                        kind,
+                        blend: sub.blend,
+                    },
+                    why,
+                    pick: sub.geometry.clone(),
+                    tag: mesh_tag,
+                    card,
+                    sort: crate::model_render::M2BatchSort::card(
+                        &sub.geometry,
+                        sort_group,
+                        crate::model_render::SortOrigin::Fixed(transform.translation),
+                    ),
+                    aabb: *stat_aabb,
+                    pivot: transform.transform_point(info.pivot),
+                    fade: DoodadFade {
+                        size: fade.size,
+                        local_center: Vec3::ZERO,
+                        cutout,
+                        blend,
+                    },
+                    probe: probe_slot.is_some(),
+                    anim_mat: sub.uv_anim.as_ref().is_some_and(|a| a.period > 0.0)
+                        || sub.rgb_anim.as_ref().is_some_and(|a| a.period > 0.0)
+                        || seq_owner.is_some()
+                        || stage1.as_ref().is_some_and(|s| s.animates()),
+                });
+                continue;
+            }
             let mut card_entity = commands.spawn((
                 Mesh3d(stat_mesh.clone()),
                 MeshMaterial3d(cutout.clone()),
@@ -674,6 +757,20 @@ pub fn spawn_model_entities(
             out.push(entity);
         }
     }
+    if !stored.is_empty() {
+        // A model of cards alone keeps ribbons' fallback owner a real part: its cards spawn now.
+        let ribbons = m2.is_some_and(|(m, _)| !m.ribbons.is_empty());
+        if ribbons && out.is_empty() {
+            out.extend(stored.iter().map(|c| c.spawn(commands).id()));
+        } else {
+            // Last in the list, so no site that takes the first entity picks the holder.
+            out.push(
+                commands
+                    .spawn(crate::card_store::CardHolder::new(stored))
+                    .id(),
+            );
+        }
+    }
     // Animation runs while a submesh is drawn or, for a meshless host, while its gate admits it.
     let arm = host.as_ref().and_then(|h| h.seq.map(|_| h.root));
     let placement_host = host.map(|mut h| {
@@ -720,6 +817,7 @@ pub fn spawn_model_entities(
         entities: out,
         by_batch,
         host: placement_host,
+        entity_batches,
     }
 }
 
