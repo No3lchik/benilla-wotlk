@@ -491,10 +491,10 @@ pub(super) fn spawn_fetch(url: String) -> crossbeam_channel::Receiver<Option<Vec
     rx
 }
 
-/// Whether this run may touch the network or the desktop for the alert: not a test, and not a
-/// capture or any other unattended run.
+/// Whether this run may touch the network or the desktop for the alert: not a test, not a
+/// capture or any other unattended run, and not the server-less survivors mode.
 pub(super) fn allowed() -> bool {
-    !cfg!(test) && !crate::run_mode::unattended()
+    !cfg!(test) && !crate::run_mode::unattended() && !crate::survivors::active()
 }
 
 /// Whether the first glue VM of the process has been seen: the reference initialises its glue

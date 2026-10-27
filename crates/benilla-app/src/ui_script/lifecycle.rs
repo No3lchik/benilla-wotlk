@@ -14,6 +14,12 @@ use super::{load_ingame_ui, CursorPayloadHeld, PlayerUiHover, UiClock, UiKeyboar
 use crate::ui_script::addons;
 
 pub(crate) fn setup_script(world: &mut World) {
+    // Survivors never shows the glue screens, so it holds the boot VM a world-only run needs:
+    // no GlueXML, no glue music, no server alert fetch.
+    if crate::survivors::active() {
+        install_boot_vm(world);
+        return;
+    }
     install_glue_side_vm(world, super::glue::GlueScreen::Login);
 }
 
