@@ -49,9 +49,16 @@ impl Plugin for SurvivorsPlugin {
         // and it gates the player controller and its camera off.
         app.insert_resource(crate::run_mode::CaptureMode)
             .init_resource::<hero::CamRig>()
+            .init_resource::<hero::AimPoint>()
             .add_systems(
                 Update,
-                (hero::spawn_hero, hero::drive_hero, hero::place_camera)
+                (
+                    hero::spawn_hero,
+                    hero::drop_stray_buttons,
+                    hero::aim_cursor,
+                    hero::drive_hero,
+                    hero::place_camera,
+                )
                     .chain()
                     .in_set(WorldStage::Input),
             );

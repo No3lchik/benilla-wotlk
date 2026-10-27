@@ -80,6 +80,8 @@ pub(super) fn spawn_unit(commands: &mut Commands, spec: &UnitSpec, pos: Vec3, ya
             },
             ObjectStore(unit_fields(spec)),
             crate::creature_anim::MovementState::default(),
+            // Our systems turn it; the display-facing pump must not swing it back.
+            crate::net::ScriptedFacing,
             Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw)),
             Visibility::default(),
             RunEntity,
