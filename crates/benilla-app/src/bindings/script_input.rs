@@ -78,8 +78,9 @@ fn fired_input(input: FiredInput) -> (Input, f32) {
 }
 
 impl BindingsState {
-    /// Apply Lua's binding calls, in call order.
-    pub(super) fn apply_script_input(&mut self, inputs: Vec<BindingInput>) {
+    /// Apply Lua's binding calls, in call order. `pub(crate)` for the survivors mode, which has no
+    /// FrameXML VM and feeds the same calls from its own key map (fork hook #8).
+    pub(crate) fn apply_script_input(&mut self, inputs: Vec<BindingInput>) {
         for input in inputs {
             match input {
                 // The set helper `0x514840` early-outs on a bit already set, so a Start on a held

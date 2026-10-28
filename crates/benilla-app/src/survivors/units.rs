@@ -33,15 +33,6 @@ pub(super) fn wow_to_bevy(p: [f32; 3]) -> Vec3 {
     Vec3::new(-p[1], p[2], -p[0])
 }
 
-/// The Bevy yaw that faces a model along `dir` (its XZ part).
-pub(super) fn yaw_toward(dir: Vec3) -> f32 {
-    (-dir.x).atan2(-dir.z)
-}
-
-pub(super) fn flat(v: Vec3) -> Vec3 {
-    Vec3::new(v.x, 0.0, v.z)
-}
-
 pub(super) struct UnitSpec {
     pub serial: u64,
     /// `CreatureDisplayInfo.dbc` row.
@@ -53,8 +44,13 @@ pub(super) struct UnitSpec {
     pub bytes0: u32,
 }
 
+/// The guid a unit of this serial carries.
+pub(super) fn guid_of(serial: u64) -> u64 {
+    HIGH_CREATURE | serial
+}
+
 fn unit_fields(spec: &UnitSpec) -> ObjectFields {
-    let guid = HIGH_CREATURE | spec.serial;
+    let guid = guid_of(spec.serial);
     ObjectFields::from_pairs(&[
         (FIELD_GUID_LOW, guid as u32),
         (FIELD_GUID_HIGH, (guid >> 32) as u32),
@@ -72,7 +68,7 @@ fn unit_fields(spec: &UnitSpec) -> ObjectFields {
 pub(super) fn spawn_unit(commands: &mut Commands, spec: &UnitSpec, pos: Vec3, yaw: f32) -> Entity {
     commands
         .spawn((
-            Guid(HIGH_CREATURE | spec.serial),
+            Guid(guid_of(spec.serial)),
             NetEntity {
                 kind: benilla_protocol::EntityKind::Unit,
                 display_id: Some(spec.display),
@@ -121,7 +117,5 @@ mod tests {
         assert_eq!(wow_to_bevy([1.0, 0.0, 0.0]), Vec3::new(0.0, 0.0, -1.0));
         assert_eq!(wow_to_bevy([0.0, 1.0, 0.0]), Vec3::new(-1.0, 0.0, 0.0));
         assert_eq!(wow_to_bevy([0.0, 0.0, 1.0]), Vec3::Y);
-        // A model faces −Z at yaw 0.
-        assert!(yaw_toward(Vec3::NEG_Z).abs() < 1e-6);
     }
 }

@@ -1,6 +1,6 @@
 //! The test ground's markers, for checking movement by eye and in frame captures: a post every
-//! [`STEP`] yards around the arena centre, the hero's facing as an arrow at his feet, and the
-//! cursor's aim point. Plain unlit meshes, as `raid_marks.rs` draws its marks.
+//! [`STEP`] yards around the arena centre and the hero's facing as an arrow at his feet. Plain unlit
+//! meshes, as `raid_marks.rs` draws its marks.
 //!
 //! Colours: the centre post is white; the north–south line (WoW +X, Bevy −Z) blue, the east–west
 //! line red, the rest grey. The posts at the north end of the blue line stand twice as tall, so
@@ -9,7 +9,7 @@
 use benilla_world::world_point::WorldPoint;
 use bevy::prelude::*;
 
-use super::hero::{AimPoint, Hero};
+use super::hero::Hero;
 use super::RunEntity;
 
 /// Yards between neighbouring posts.
@@ -17,9 +17,6 @@ const STEP: f32 = 10.0;
 /// Posts on each side of the centre along each axis.
 const REACH: i32 = 4;
 const POST_HEIGHT: f32 = 3.0;
-
-#[derive(Component)]
-pub(super) struct AimMarker;
 
 /// The arrow under the hero; a child of his body, so it turns with him.
 #[derive(Component)]
@@ -103,35 +100,8 @@ pub(super) fn spawn_markers(
         .id();
     commands.entity(hero).add_child(arrow);
 
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(0.5, 1.5, 0.5))),
-        MeshMaterial3d(unlit(&mut materials, Color::srgb(1.0, 0.1, 0.9))),
-        Transform::default(),
-        Visibility::Hidden,
-        AimMarker,
-        RunEntity,
-    ));
     info!(
         "survivors: markers planted, {} posts every {STEP} yd",
         (2 * REACH + 1).pow(2)
     );
-}
-
-/// The magenta post stands where the cursor meets the ground; hidden when it meets nothing.
-pub(super) fn place_aim_marker(
-    aim: Res<AimPoint>,
-    mut marker: Query<(&mut Transform, &mut Visibility), With<AimMarker>>,
-) {
-    let Ok((mut tf, mut vis)) = marker.single_mut() else {
-        return;
-    };
-    match aim.point() {
-        Some(p) => {
-            tf.translation = p + Vec3::Y * 0.75;
-            vis.set_if_neq(Visibility::Inherited);
-        }
-        None => {
-            vis.set_if_neq(Visibility::Hidden);
-        }
-    }
 }
