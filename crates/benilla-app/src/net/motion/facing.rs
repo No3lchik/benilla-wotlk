@@ -48,6 +48,11 @@ pub(crate) struct DisplayFacing {
     hist: [f32; 4],
 }
 
+/// A local unit whose facing its own game logic writes every frame (the survivors mode): no wire
+/// facing exists to swing it back to, so [`drive_display_facing`] leaves it alone.
+#[derive(Component)]
+pub(crate) struct ScriptedFacing;
+
 /// The signed yaw the facing pump applied this frame (positive turns left), the client's
 /// `0x607ed0` shuffle latch input; removed the frame the body stops moving.
 #[derive(Component)]
@@ -169,7 +174,12 @@ pub(crate) fn drive_display_facing(
     emotes: Option<Res<crate::sound::EmoteSounds>>,
     candidates: Query<
         (Entity, &NetEntity, &ObjectStore),
-        (Without<Spline>, Without<RemoteMotion>, Without<ActiveMover>),
+        (
+            Without<Spline>,
+            Without<RemoteMotion>,
+            Without<ActiveMover>,
+            Without<ScriptedFacing>,
+        ),
     >,
     self_q: Query<Entity, With<SelfPlayer>>,
     mut transforms: Query<&mut Transform>,

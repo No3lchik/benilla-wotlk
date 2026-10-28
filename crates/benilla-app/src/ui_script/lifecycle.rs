@@ -14,6 +14,12 @@ use super::{load_ingame_ui, CursorPayloadHeld, PlayerUiHover, UiClock, UiKeyboar
 use crate::ui_script::addons;
 
 pub(crate) fn setup_script(world: &mut World) {
+    // Survivors never shows the glue screens, so it holds the boot VM a world-only run needs:
+    // no GlueXML, no glue music, no server alert fetch.
+    if crate::survivors::active() {
+        install_boot_vm(world);
+        return;
+    }
     install_glue_side_vm(world, super::glue::GlueScreen::Login);
 }
 
@@ -226,6 +232,10 @@ fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
 /// Whether this run wants the player UI: always outside a capture, and in one only when opted in
 /// ([`crate::run_mode::capture_ui_opted_in`]), since capture baselines test the world render.
 fn ui_wanted(world: &World) -> bool {
+    // Survivors: the mode draws its own HUD over the stock player controller (fork hook #7).
+    if crate::survivors::active() {
+        return false;
+    }
     !world.contains_resource::<crate::run_mode::CaptureMode>()
         || crate::run_mode::capture_ui_opted_in()
 }

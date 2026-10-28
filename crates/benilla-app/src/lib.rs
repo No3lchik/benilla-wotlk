@@ -110,6 +110,8 @@ mod sound;
 /// The two talent spell-modifier tables (`SMSG_SET_FLAT_/PCT_SPELL_MODIFIER`) and the read that
 /// puts them on a number.
 mod spell;
+/// Warcraft Survivors: the server-less survival mode the `warcraft-survivors` launcher boots.
+mod survivors;
 /// The melee swing refusal's latch + 4 s repeat (`SMSG_ATTACKSWING_*`).
 mod swing_refusal;
 mod target;
@@ -236,6 +238,13 @@ pub fn run_with(build: BuildId, extend: impl FnOnce(&mut App)) -> AppExit {
     launch(build, Some(Box::new(extend)))
 }
 
+/// Warcraft Survivors: the client booted server-less straight into the world, with the
+/// [`survivors`] mode on top, called by the `warcraft-survivors` launcher.
+pub fn run_survivors(build: BuildId) -> AppExit {
+    survivors::ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    launch(build, None)
+}
+
 /// The state folder, `benilla-config/`, where a crate on top keeps its own files. `None` when
 /// persistence is off (a capture run, or no executable path), and it may not exist yet. A dev
 /// build resolves it from the launcher's folder, which [`run_with`] sets, so ask from `extend` or
@@ -353,6 +362,12 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     // With `$WOW_CAPTURE` set the app runs a deterministic, server-less capture (net off, so no
     // NPCs stream in) and exits.
     let capturing = run_mode::scenario_active();
+    // Survivors runs server-less too, on its arena's map; `world_map` reads `$WOW_MAP` at
+    // `Startup`, so it is seeded here unless the caller already chose one.
+    let survivors = survivors::active();
+    if survivors && std::env::var_os("WOW_MAP").is_none() {
+        std::env::set_var("WOW_MAP", survivors::START_MAP.to_string());
+    }
     // Every instrumented run, captures and live probes, opens in the background so it never takes
     // over a person's screen; `WOW_BG` overrides.
     let background = benilla_world::bgwin::background_run();
@@ -388,7 +403,12 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     // (`embedded://benilla_app/shaders/…`), so no build-machine path reaches the binary.
 
     app.add_plugins(benilla_world::boot::tuned_default_plugins(Window {
-        title: "benilla".into(),
+        title: if survivors {
+            "Warcraft Survivors"
+        } else {
+            "benilla"
+        }
+        .into(),
         // Born in the player's display mode (`gxWindow` read straight off `Config.wtf`) rather
         // than flipped into it at `Startup`, which would flash on every launch and, under
         // gamescope, spend the first second in the input state fullscreen is meant to end.
@@ -477,9 +497,17 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     // The game as one group on top of the engine; `game_plugins.rs` has its members, its
     // load-bearing ordering edges and the test that builds it headless.
     .add_plugins(game_plugins::GamePlugins {
-        connect: !capturing,
-        start: run_mode::start_state(),
+        // Survivors never opens a socket: no login, no realm, no world server.
+        connect: !capturing && !survivors,
+        start: if survivors {
+            char_select::ClientState::InWorld
+        } else {
+            run_mode::start_state()
+        },
     });
+    if survivors {
+        app.add_plugins(survivors::SurvivorsPlugin);
+    }
 
     // benilla-assets' loaders go into the live `AssetServer`, so they register after `AssetPlugin`.
     benilla_assets::register_asset_loaders(&mut app);
