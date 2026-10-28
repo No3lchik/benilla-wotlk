@@ -8,6 +8,7 @@
 //! `units.rs`), re-checked against this engine.
 
 mod hero;
+mod markers;
 mod units;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +59,8 @@ impl Plugin for SurvivorsPlugin {
                     hero::aim_cursor,
                     hero::drive_hero,
                     hero::place_camera,
+                    markers::spawn_markers,
+                    markers::place_aim_marker,
                 )
                     .chain()
                     .in_set(WorldStage::Input),

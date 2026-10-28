@@ -80,8 +80,14 @@ impl Default for CamRig {
 #[derive(Resource, Default)]
 pub(super) struct AimPoint(Option<Vec3>);
 
+impl AimPoint {
+    pub(super) fn point(&self) -> Option<Vec3> {
+        self.0
+    }
+}
+
 /// Where the run starts, in Bevy coordinates.
-fn arena_center() -> Vec3 {
+pub(super) fn arena_center() -> Vec3 {
     wow_to_bevy(ARENA.center)
 }
 
